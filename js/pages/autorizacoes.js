@@ -614,12 +614,16 @@ function openAutModal(id) {
 async function saveAut(id) {
   const form = document.getElementById('aut-form');
   const errBox = document.getElementById('aut-errors');
-  errBox.style.display = 'none';
-  if (!form.checkValidity()) { form.reportValidity(); return; }
+  if (errBox) errBox.style.display = 'none';
+  if (!form || !form.checkValidity()) { form?.reportValidity(); return; }
   const v = formValues(form);
 
   // Aviso de duplicata: se já existe autorização emitida/utilizada do mesmo
   // veículo na mesma data, confirma antes (não bloqueia, só alerta).
+  // IMPORTANTE: confirmDialog abre um novo modal — o sistema só suporta 1
+  // modal por vez, então isso FECHA o modal de emissão. Após o confirm o
+  // form não existe mais no DOM. Tratamos com `setDOM` guards abaixo.
+  let formGone = false;
   if (!id) {
     const dup = _items.filter(a =>
       a.vehicle_id === v.vehicle_id
@@ -634,12 +638,15 @@ async function saveAut(id) {
         cancelText: 'Cancelar',
       });
       if (!ok) return;
+      formGone = true; // modal de emissão foi fechado pelo confirmDialog
     }
   }
 
-  const btn = document.getElementById('aut-save-btn');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Salvando...';
+  const btn = formGone ? null : document.getElementById('aut-save-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Salvando...';
+  }
 
   try {
     if (id) {
@@ -677,10 +684,19 @@ async function saveAut(id) {
     renderLimitCard();
     renderTable();
   } catch (err) {
-    errBox.innerHTML = '⚠️ ' + (err.message || 'Erro ao salvar.');
-    errBox.style.display = 'block';
-    btn.disabled = false;
-    btn.textContent = id ? 'Salvar quantidade' : 'Emitir autorização';
+    // Se o modal de emissão ainda existe (caminho normal), mostra erro inline.
+    // Se foi fechado pelo confirmDialog (duplicata), usa toast.
+    const msg = err.message || 'Erro ao salvar.';
+    if (errBox && document.body.contains(errBox)) {
+      errBox.innerHTML = '⚠️ ' + msg;
+      errBox.style.display = 'block';
+    } else {
+      toast(msg, 'error');
+    }
+    if (btn && document.body.contains(btn)) {
+      btn.disabled = false;
+      btn.textContent = id ? 'Salvar quantidade' : 'Emitir autorização';
+    }
   }
 }
 

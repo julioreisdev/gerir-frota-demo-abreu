@@ -306,11 +306,14 @@ function openSrvModal(id) {
 async function saveSrv(id) {
   const form = document.getElementById('srv-form');
   const errBox = document.getElementById('srv-errors');
-  errBox.style.display = 'none';
-  if (!form.checkValidity()) { form.reportValidity(); return; }
+  if (errBox) errBox.style.display = 'none';
+  if (!form || !form.checkValidity()) { form?.reportValidity(); return; }
   const v = formValues(form);
 
-  // Aviso de duplicata na mesma data + veículo
+  // Aviso de duplicata na mesma data + veículo.
+  // confirmDialog fecha o modal de emissão (1 modal por vez). Por isso
+  // marcamos formGone e protegemos os acessos ao DOM depois.
+  let formGone = false;
   if (!id) {
     const dup = _items.filter(a =>
       a.vehicle_id === v.vehicle_id
@@ -325,12 +328,15 @@ async function saveSrv(id) {
         cancelText: 'Cancelar',
       });
       if (!ok) return;
+      formGone = true;
     }
   }
 
-  const btn = document.getElementById('srv-save-btn');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Salvando...';
+  const btn = formGone ? null : document.getElementById('srv-save-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Salvando...';
+  }
   try {
     if (id) {
       const { error } = await supabase.rpc('update_service_authorization', {
@@ -362,10 +368,17 @@ async function saveSrv(id) {
       setTimeout(() => openQRModal(data), 200);
     }
   } catch (err) {
-    errBox.innerHTML = '⚠️ ' + (err.message || 'Erro ao salvar.');
-    errBox.style.display = 'block';
-    btn.disabled = false;
-    btn.textContent = id ? 'Salvar alterações' : 'Emitir autorização';
+    const msg = err.message || 'Erro ao salvar.';
+    if (errBox && document.body.contains(errBox)) {
+      errBox.innerHTML = '⚠️ ' + msg;
+      errBox.style.display = 'block';
+    } else {
+      toast(msg, 'error');
+    }
+    if (btn && document.body.contains(btn)) {
+      btn.disabled = false;
+      btn.textContent = id ? 'Salvar alterações' : 'Emitir autorização';
+    }
   }
 }
 
