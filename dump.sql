@@ -1,6 +1,6 @@
 -- =============================================================================
--- gerirfrota — dump.sql (instância JUREMA)
--- Seeds (lookups + IBGE) + entidade (Jurema) + usuário admin.
+-- gerirfrota — dump.sql (instância DEMO — Anísio de Abreu)
+-- Seeds (lookups + IBGE) + entidade (Anísio de Abreu, demonstração) + usuário admin.
 -- Rodar DEPOIS de init.sql.
 --
 -- Para clonar para uma nova cidade:
@@ -291,14 +291,14 @@ insert into ibge_municipality (code, name) values
   ('2211704','Wall Ferraz');
 
 -- =============================================================================
--- ENTIDADE: Prefeitura Municipal de Jurema (IBGE 2205532)
+-- ENTIDADE: Prefeitura Municipal de Anísio de Abreu (IBGE 2200707) — instância de demonstração
 -- =============================================================================
 insert into entity (id, entity_type, ibge_code, organ_name, coat_of_arms_url, default_ref_month)
 values (
   1,
   'Prefeitura Municipal',
-  '2205532',
-  'Prefeitura Municipal de Jurema',
+  '2200707',
+  'Prefeitura Municipal de Anísio de Abreu',
   null,
   to_char(current_date, 'YYYY-MM')
 );
