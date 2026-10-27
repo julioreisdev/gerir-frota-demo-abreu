@@ -2955,5 +2955,397 @@ $$;
 revoke all on function delete_service_authorization(uuid) from public;
 grant execute on function delete_service_authorization(uuid) to authenticated;
 
+-- =============================================================================
+-- 25) ASSINATURAS — cargo acompanha o nome no fallback (out/2026)
+--   Quando o responsável da secretaria está vazio (ou é um login) a assinatura
+--   sai com o nome completo de quem emitiu; agora o cargo também passa a ser o
+--   job_title de quem emitiu, e não o cargo cadastrado na secretaria.
+--   Vale para OF, termo do combustível (gatilho), OS e termo de serviço.
+-- =============================================================================
+
+-- Cargo da assinatura: o da secretaria quando o nome da secretaria é usado;
+-- o job_title de quem emitiu quando o nome cai para o emissor.
+create or replace function _responsible_role_or_issuer(p_name text, p_role text) returns text
+language plpgsql stable security definer set search_path = public, auth as $$
+declare v text := nullif(btrim(coalesce(p_name, '')), ''); v_role text;
+begin
+  if v is not null and not exists (select 1 from app_user u where lower(u.username) = lower(v)) then
+    return p_role;
+  end if;
+  select nullif(btrim(coalesce(job_title, '')), '') into v_role from app_user where id = auth.uid();
+  return v_role;
+end;
+$$;
+revoke all on function _responsible_role_or_issuer(text, text) from public;
+grant execute on function _responsible_role_or_issuer(text, text) to authenticated;
+
+-- OF e termo do combustível: o cargo é decidido antes de trocar o nome.
+create or replace function fill_responsible_snapshot() returns trigger
+language plpgsql security definer set search_path = public, auth as $$
+begin
+  new.responsible_role_snapshot := _responsible_role_or_issuer(new.responsible_name_snapshot, new.responsible_role_snapshot);
+  new.responsible_name_snapshot := _responsible_or_issuer(new.responsible_name_snapshot);
+  return new;
+end;
+$$;
+
+-- OS: mesma regra na emissão (função reescrita só nesta linha)
+create or replace function emit_service_order(
+  p_date date,
+  p_vehicle_id uuid,
+  p_supplier_id uuid,
+  p_service_kind service_kind,
+  p_description text,
+  p_value_services numeric,
+  p_value_parts numeric,
+  p_km_in integer,
+  p_responsible_name text,
+  p_notes text default null,
+  p_driver_id uuid default null,
+  p_commitment text default null,
+  p_budget_ref text default null,
+  p_parent_id uuid default null,
+  p_number text default null
+) returns uuid
+language plpgsql security definer set search_path = public, auth as $$
+declare
+  v_id uuid; v_veh vehicle%rowtype; v_sup supplier%rowtype; v_dep department%rowtype;
+  v_parent service_authorization%rowtype;
+  v_services numeric(12,2) := round(coalesce(p_value_services, 0), 2);
+  v_parts numeric(12,2) := round(coalesce(p_value_parts, 0), 2);
+  v_total numeric(12,2); v_km integer := p_km_in;
+  v_numbering text; v_ext text := nullif(btrim(coalesce(p_number, '')), '');
+  v_year smallint; v_seq integer; v_number text;
+  v_commit text := nullif(btrim(coalesce(p_commitment, '')), '');
+  v_budget text := nullif(btrim(coalesce(p_budget_ref, '')), '');
+  v_issuer_name text; v_issuer_role text; v_qr text;
+begin
+  if current_user_role() is null or current_user_role() not in ('admin','usuario') then
+    raise exception 'Seu perfil não pode emitir ordem de serviço.' using errcode = '42501';
+  end if;
+
+  select * into v_veh from vehicle where id = p_vehicle_id and deleted_at is null;
+  if v_veh.id is null then raise exception 'Veículo não encontrado.'; end if;
+  select * into v_sup from supplier where id = p_supplier_id;
+  if v_sup.id is null then raise exception 'Mecânica não encontrada.'; end if;
+  if v_sup.kind not in ('mecanica','ambos') then
+    raise exception 'Fornecedor cadastrado apenas como Posto não pode receber ordem de serviço.';
+  end if;
+  if v_sup.department_id is null then
+    raise exception 'O contrato da mecânica não tem secretaria. Informe a secretaria no cadastro do fornecedor.';
+  end if;
+  if v_veh.department_id is not null and v_sup.department_id <> v_veh.department_id then
+    raise exception 'A mecânica não tem contrato com a secretaria do veículo.';
+  end if;
+  if current_user_role() = 'usuario' and current_user_department_id() is not null
+     and current_user_department_id() is distinct from v_sup.department_id then
+    raise exception 'Você só pode emitir ordem de serviço para a sua secretaria.' using errcode = '42501';
+  end if;
+  select * into v_dep from department where id = v_sup.department_id;
+
+  -- Valores: serviços (mão de obra) e peças; o estimado é a soma
+  if v_services < 0 or v_parts < 0 then raise exception 'Os valores não podem ser negativos.'; end if;
+  v_total := v_services + v_parts;
+  if v_total <= 0 then raise exception 'Informe o valor estimado de serviços ou de peças.'; end if;
+
+  -- Km na entrada na oficina
+  if v_veh.vehicle_type_code = 99 then
+    v_km := 99999999;
+  else
+    if v_km is null then raise exception 'Informe o km do veículo na entrada na oficina.'; end if;
+    if v_km < 0 or v_km >= 99999999 then raise exception 'Km na entrada inválido.'; end if;
+    if v_veh.current_km > 0 and v_km < v_veh.current_km then
+      raise exception 'O km na entrada (%) é menor que o último km registrado do veículo (%).', v_km, v_veh.current_km;
+    end if;
+  end if;
+
+  -- OS complementar: mesma placa, origem numerada e não cancelada (pode estar concluída)
+  if p_parent_id is not null then
+    select * into v_parent from service_authorization where id = p_parent_id and deleted_at is null;
+    if v_parent.id is null then raise exception 'Ordem de serviço de origem não encontrada.'; end if;
+    if v_parent.os_number is null then raise exception 'A ordem de origem não é uma Ordem de Serviço numerada.'; end if;
+    if v_parent.status = 'cancelada' then raise exception 'A ordem de origem está cancelada.'; end if;
+    if v_parent.vehicle_id <> p_vehicle_id then
+      raise exception 'A OS complementar precisa ser do mesmo veículo da ordem de origem (%).', v_parent.vehicle_plate_snapshot;
+    end if;
+  end if;
+
+  -- Numeração: sequência geral do município no exercício, própria das OS
+  select coalesce(service_order_numbering, 'auto') into v_numbering from entity where id = 1;
+  if v_ext is not null and v_numbering <> 'opcional' then
+    raise exception 'Esta cidade numera as ordens de serviço automaticamente. Deixe o número em branco.';
+  end if;
+  if length(v_ext) > 30 then raise exception 'O número da ordem tem no máximo 30 caracteres.'; end if;
+  v_year := extract(year from p_date)::smallint;
+  perform pg_advisory_xact_lock(hashtext('service_order_' || v_year::text));
+  if v_ext is not null then
+    if exists (select 1 from service_authorization o
+                where o.os_year = v_year and o.deleted_at is null and o.status <> 'cancelada'
+                  and upper(btrim(o.os_number)) = upper(v_ext)) then
+      raise exception 'Já existe uma ordem de serviço nº % em %.', v_ext, v_year;
+    end if;
+    v_seq := null;
+    v_number := v_ext;
+  else
+    select coalesce(max(os_seq), 0) + 1 into v_seq from service_authorization where os_year = v_year;
+    loop   -- pula número que já tenha sido informado à mão
+      v_number := lpad(v_seq::text, greatest(3, length(v_seq::text)), '0') || '/' || v_year::text;
+      exit when not exists (select 1 from service_authorization o
+                             where o.os_year = v_year and o.deleted_at is null
+                               and upper(btrim(o.os_number)) = v_number);
+      v_seq := v_seq + 1;
+    end loop;
+  end if;
+
+  -- Emissão de sempre (limite mensal, QR, cópias do veículo e da mecânica)
+  if p_driver_id is not null then
+    v_id := emit_service_authorization_with_driver(p_date, p_vehicle_id, p_supplier_id, p_service_kind,
+              p_description, v_total, p_responsible_name, p_driver_id, p_notes);
+  else
+    v_id := emit_service_authorization(p_date, p_vehicle_id, p_supplier_id, p_service_kind,
+              p_description, v_total, p_responsible_name, p_notes);
+  end if;
+
+  -- Campos da OS e cópias do cabeçalho e de quem emitiu
+  select full_name, job_title into v_issuer_name, v_issuer_role from app_user where id = auth.uid();
+  select qr_payload into v_qr from service_authorization where id = v_id;
+  v_qr := replace(v_qr, E'\nData:', E'\nOS nº: ' || v_number || E'\nData:');
+  v_qr := _qr_service_values(v_qr, v_services, v_parts, v_total);
+
+  update service_authorization set
+    os_year = v_year, os_seq = v_seq, os_number = v_number, os_external = (v_ext is not null),
+    parent_id = p_parent_id,
+    commitment_number = v_commit,
+    commitment_set_by = case when v_commit is not null then auth.uid() end,
+    commitment_set_at = case when v_commit is not null then now() end,
+    km_in = v_km, budget_ref = v_budget,
+    value_services = v_services, value_parts = v_parts,
+    department_name_snapshot = v_dep.name,
+    department_cnpj_snapshot = v_dep.cnpj,
+    responsible_name_snapshot = _responsible_or_issuer(v_dep.responsible_name),
+    responsible_role_snapshot = _responsible_role_or_issuer(v_dep.responsible_name, v_dep.responsible_role),
+    supplier_cnpj_snapshot = v_sup.cnpj,
+    contract_number_snapshot = v_sup.contract_number,
+    issuer_name_snapshot = v_issuer_name,
+    issuer_role_snapshot = v_issuer_role,
+    qr_payload = v_qr
+  where id = v_id;
+
+  -- O km de entrada passa a ser a referência do veículo
+  if v_veh.vehicle_type_code <> 99 then
+    update vehicle set current_km = greatest(current_km, v_km) where id = p_vehicle_id;
+  end if;
+
+  return v_id;
+end;
+$$;
+revoke all on function emit_service_order(date,uuid,uuid,service_kind,text,numeric,numeric,integer,text,text,uuid,text,text,uuid,text) from public;
+grant execute on function emit_service_order(date,uuid,uuid,service_kind,text,numeric,numeric,integer,text,text,uuid,text,text,uuid,text) to authenticated;
+
+-- Termo de serviço: mesma regra (função reescrita só nesta linha)
+create or replace function emit_service_receipt_term(
+  p_auth_id uuid,
+  p_delivery_date date,
+  p_km_out integer,
+  p_service_done text,
+  p_tested_ok boolean,
+  p_parts_returned boolean,
+  p_invoices jsonb,
+  p_fiscal_name text,
+  p_fiscal_cpf text,
+  p_fiscal_ordinance text,
+  p_fiscal_ordinance_date date,
+  p_warranty text default null,
+  p_notes text default null,
+  p_commitment text default null,
+  p_issue_date date default null,
+  p_fiscal_registration text default null
+) returns uuid
+language plpgsql security definer set search_path = public, auth as $$
+declare
+  v_a service_authorization%rowtype; v_veh vehicle%rowtype; v_dep department%rowtype; v_sup supplier%rowtype;
+  v_issue date := coalesce(p_issue_date, current_date);
+  v_done text := nullif(btrim(coalesce(p_service_done, '')), '');
+  v_commit text := nullif(btrim(coalesce(p_commitment, '')), '');
+  v_fiscal text := nullif(btrim(coalesce(p_fiscal_name, '')), '');
+  v_cpf text := regexp_replace(coalesce(p_fiscal_cpf, ''), '\D', '', 'g');
+  v_ord text := nullif(btrim(regexp_replace(coalesce(p_fiscal_ordinance, ''), '^\s*portaria\s*(n[ºo°.]*)?\s*', '', 'i')), '');
+  v_km integer := p_km_out;
+  v_id uuid; v_total numeric(14,2) := 0; v_n integer := 0; v_has_service boolean := false;
+  inv jsonb; v_kind text; v_sid uuid; v_sname text; v_scnpj text; v_num text; v_series text; v_date date; v_amount numeric(14,2);
+  v_digits text; v_maint_id uuid;
+begin
+  v_a := _service_term_require(p_auth_id);
+  if v_a.os_number is null then
+    raise exception 'Esta autorização é anterior às ordens de serviço numeradas: conclua pelo registro de manutenção.';
+  end if;
+  if v_a.status = 'cancelada' then raise exception 'Esta ordem de serviço está cancelada.'; end if;
+  if v_a.status <> 'emitida' then
+    raise exception 'Esta ordem de serviço já está concluída. Para gerar outro termo, cancele o termo atual.';
+  end if;
+  if exists (select 1 from service_receipt_term t where t.service_authorization_id = p_auth_id and t.status = 'emitido') then
+    raise exception 'Esta ordem de serviço já tem Termo de Recebimento. Para gerar outro, cancele o termo atual.';
+  end if;
+  perform 1 from service_authorization where id = p_auth_id for update;
+  select * into v_veh from vehicle where id = v_a.vehicle_id;
+  select * into v_sup from supplier where id = v_a.supplier_id;
+  select * into v_dep from department where id = v_sup.department_id;
+
+  -- Serviço, vistoria, datas
+  if v_done is null then raise exception 'Informe o serviço executado.'; end if;
+  if not coalesce(p_tested_ok, false) then raise exception 'Confirme que o veículo foi testado e está funcionando.'; end if;
+  if not coalesce(p_parts_returned, false) then raise exception 'Confirme que as peças substituídas foram entregues para conferência.'; end if;
+  if p_delivery_date is null then raise exception 'Informe a data de entrega do veículo.'; end if;
+  if p_delivery_date < v_a.date then
+    raise exception 'A data de entrega não pode ser anterior à ordem de serviço (%).', to_char(v_a.date, 'DD/MM/YYYY');
+  end if;
+  if p_delivery_date > current_date then raise exception 'A data de entrega não pode ser futura.'; end if;
+  if v_issue > current_date then raise exception 'A data do termo não pode ser futura.'; end if;
+  if v_issue < p_delivery_date then raise exception 'A data do termo não pode ser anterior à data de entrega.'; end if;
+  if v_issue < v_a.date then
+    raise exception 'A data do termo não pode ser anterior à ordem de serviço (%).', to_char(v_a.date, 'DD/MM/YYYY');
+  end if;
+
+  -- Km na entrega
+  if v_veh.vehicle_type_code = 99 then
+    v_km := 99999999;
+  else
+    if v_km is null then raise exception 'Informe o km do veículo na entrega.'; end if;
+    if v_km < 0 or v_km >= 99999999 then raise exception 'Km na entrega inválido.'; end if;
+    if v_a.km_in is not null and v_km < v_a.km_in then
+      raise exception 'O km na entrega (%) é menor que o km na entrada (%).', v_km, v_a.km_in;
+    end if;
+  end if;
+
+  -- Empenho: vem da OS; se vazio, é informado aqui e gravado na OS
+  v_commit := coalesce(v_commit, nullif(btrim(coalesce(v_a.commitment_number, '')), ''));
+  if v_commit is null then raise exception 'Informe o número do empenho.'; end if;
+
+  -- Fiscal do contrato
+  if v_fiscal is null then raise exception 'Informe o fiscal do contrato.'; end if;
+  if v_cpf = '' then raise exception 'Informe o CPF do fiscal do contrato.'; end if;
+  if not is_valid_cpf(v_cpf) then raise exception 'CPF do fiscal inválido.'; end if;
+  if v_ord is null then raise exception 'Informe o número da portaria do fiscal.'; end if;
+  if p_fiscal_ordinance_date is null then raise exception 'Informe a data da portaria do fiscal.'; end if;
+  if p_fiscal_ordinance_date > current_date then raise exception 'A data da portaria não pode ser futura.'; end if;
+
+  -- Notas fiscais
+  if p_invoices is null or jsonb_typeof(p_invoices) <> 'array' or jsonb_array_length(p_invoices) = 0 then
+    raise exception 'Informe pelo menos uma nota fiscal.';
+  end if;
+  for inv in select * from jsonb_array_elements(p_invoices) loop
+    v_n := v_n + 1;
+    v_kind := inv ->> 'kind';
+    if v_kind not in ('servico','pecas') then raise exception 'Nota %: tipo inválido (serviço ou peças).', v_n; end if;
+    v_sid := nullif(inv ->> 'supplier_id', '')::uuid;
+    if v_sid is not null then
+      select legal_name, cnpj into v_sname, v_scnpj from supplier where id = v_sid;
+      if v_sname is null then raise exception 'Nota %: fornecedor não encontrado.', v_n; end if;
+      v_sname := coalesce(nullif(btrim(coalesce(inv ->> 'supplier_name', '')), ''), v_sname);
+    else
+      v_sname := nullif(btrim(coalesce(inv ->> 'supplier_name', '')), '');
+      v_scnpj := regexp_replace(coalesce(inv ->> 'supplier_cnpj', ''), '\D', '', 'g');
+    end if;
+    if v_sname is null then raise exception 'Nota %: informe o fornecedor.', v_n; end if;
+    if v_scnpj !~ '^[0-9]{14}$' then raise exception 'Nota %: CNPJ do fornecedor deve ter 14 dígitos.', v_n; end if;
+    v_num := nullif(btrim(coalesce(inv ->> 'invoice_number', '')), '');
+    if v_num is null then raise exception 'Nota %: informe o número da nota fiscal.', v_n; end if;
+    v_series := nullif(btrim(coalesce(inv ->> 'invoice_series', '')), '');
+    begin
+      v_date := (inv ->> 'invoice_date')::date;
+    exception when others then
+      raise exception 'Nota %: data inválida.', v_n;
+    end;
+    if v_date is null then raise exception 'Nota %: informe a data da nota fiscal.', v_n; end if;
+    if v_date < v_a.date then
+      raise exception 'Nota %: a data (%) é anterior à ordem de serviço (%).', v_n, to_char(v_date, 'DD/MM/YYYY'), to_char(v_a.date, 'DD/MM/YYYY');
+    end if;
+    if v_date > current_date then raise exception 'Nota %: a data não pode ser futura.', v_n; end if;
+    if v_date > v_issue then raise exception 'Nota %: a data (%) é posterior à data do termo.', v_n, to_char(v_date, 'DD/MM/YYYY'); end if;
+    if coalesce(inv ->> 'amount', '') !~ '^[0-9]+(\.[0-9]+)?$' then raise exception 'Nota %: valor inválido.', v_n; end if;
+    v_amount := round((inv ->> 'amount')::numeric, 2);
+    if v_amount <= 0 then raise exception 'Nota %: o valor deve ser maior que zero.', v_n; end if;
+    v_total := v_total + v_amount;
+    if v_kind = 'servico' then v_has_service := true; end if;
+  end loop;
+  if not v_has_service then raise exception 'Informe a nota fiscal do serviço (da mecânica).'; end if;
+  if v_total > v_a.estimated_value then
+    raise exception 'O total das notas (R$ %) passa do estimado na OS (R$ %). Emita uma OS complementar para a diferença antes de gerar o termo.',
+      to_char(v_total, 'FM999G999G990D00'), to_char(v_a.estimated_value, 'FM999G999G990D00');
+  end if;
+
+  -- Grava o termo (cópias do fiscal e do gestor)
+  insert into service_receipt_term (
+    service_authorization_id, number, issue_date, delivery_date, km_out, service_done,
+    tested_ok, parts_returned, warranty, notes, commitment_number,
+    fiscal_name, fiscal_cpf, fiscal_registration, fiscal_ordinance, fiscal_ordinance_date,
+    responsible_name_snapshot, responsible_role_snapshot, total_amount, created_by
+  ) values (
+    p_auth_id, v_a.os_number, v_issue, p_delivery_date, v_km, v_done,
+    true, true, nullif(btrim(coalesce(p_warranty, '')), ''), nullif(btrim(coalesce(p_notes, '')), ''), v_commit,
+    v_fiscal, v_cpf, nullif(btrim(coalesce(p_fiscal_registration, '')), ''), v_ord, p_fiscal_ordinance_date,
+    -- nome e cargo vêm da mesma fonte: a secretaria, se tem responsável; senão a cópia gravada na OS
+    _responsible_or_issuer(coalesce(nullif(btrim(coalesce(v_dep.responsible_name, '')), ''), v_a.responsible_name_snapshot)),
+    _responsible_role_or_issuer(
+      coalesce(nullif(btrim(coalesce(v_dep.responsible_name, '')), ''), v_a.responsible_name_snapshot),
+      case when nullif(btrim(coalesce(v_dep.responsible_name, '')), '') is not null then v_dep.responsible_role else v_a.responsible_role_snapshot end),
+    v_total, auth.uid()
+  ) returning id into v_id;
+
+  v_n := 0;
+  for inv in select * from jsonb_array_elements(p_invoices) loop
+    v_n := v_n + 1;
+    v_sid := nullif(inv ->> 'supplier_id', '')::uuid;
+    if v_sid is not null then
+      select legal_name, cnpj into v_sname, v_scnpj from supplier where id = v_sid;
+      v_sname := coalesce(nullif(btrim(coalesce(inv ->> 'supplier_name', '')), ''), v_sname);
+    else
+      v_sname := btrim(inv ->> 'supplier_name');
+      v_scnpj := regexp_replace(coalesce(inv ->> 'supplier_cnpj', ''), '\D', '', 'g');
+    end if;
+    v_num := btrim(inv ->> 'invoice_number');
+    v_digits := ltrim(regexp_replace(v_num, '\D', '', 'g'), '0');
+    if v_digits = '' then v_digits := '0'; end if;
+    insert into service_receipt_term_invoice (
+      term_id, line_no, kind, supplier_id, supplier_name, supplier_cnpj,
+      invoice_number, invoice_digits, invoice_series, invoice_date, amount
+    ) values (
+      v_id, v_n, inv ->> 'kind', v_sid, v_sname, v_scnpj,
+      v_num, v_digits, nullif(btrim(coalesce(inv ->> 'invoice_series', '')), ''),
+      (inv ->> 'invoice_date')::date, round((inv ->> 'amount')::numeric, 2)
+    );
+  end loop;
+
+  -- Empenho na OS, manutenção concluída e OS concluída (passando pelas travas)
+  perform set_config('gerirfrota.billing_bypass', '1', true);
+  update service_authorization
+     set commitment_number = v_commit,
+         commitment_set_by = case when v_commit is distinct from v_a.commitment_number then auth.uid() else commitment_set_by end,
+         commitment_set_at = case when v_commit is distinct from v_a.commitment_number then now() else commitment_set_at end
+   where id = p_auth_id;
+  insert into maintenance (
+    authorization_id, service_term_id, vehicle_id, supplier_id, kind, status,
+    open_date, close_date, km_at_service, description, total_value,
+    responsible_name, notes, created_by
+  ) values (
+    p_auth_id, v_id, v_a.vehicle_id, v_a.supplier_id, v_a.service_kind::text::maintenance_kind, 'concluida',
+    v_a.date, p_delivery_date, case when v_km = 99999999 then null else v_km end, v_done, v_total,
+    v_a.responsible_name, nullif(btrim(coalesce(p_notes, '')), ''), auth.uid()
+  ) returning id into v_maint_id;
+  -- (o gatilho da manutenção já passa a OS a 'utilizada'; garante mesmo assim)
+  update service_authorization set status = 'utilizada' where id = p_auth_id and status = 'emitida';
+  perform set_config('gerirfrota.billing_bypass', '0', true);
+
+  -- Km de entrega vira referência do veículo
+  if v_veh.vehicle_type_code <> 99 then
+    update vehicle set current_km = greatest(current_km, v_km) where id = v_a.vehicle_id;
+  end if;
+
+  return v_id;
+end;
+$$;
+revoke all on function emit_service_receipt_term(uuid,date,integer,text,boolean,boolean,jsonb,text,text,text,date,text,text,text,date,text) from public;
+grant execute on function emit_service_receipt_term(uuid,date,integer,text,boolean,boolean,jsonb,text,text,text,date,text,text,text,date,text) to authenticated;
+
 -- Reload do schema cache do PostgREST
 notify pgrst, 'reload schema';
