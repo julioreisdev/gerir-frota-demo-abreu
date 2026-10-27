@@ -2836,5 +2836,124 @@ $$;
 revoke all on function service_receipt_term_invoices(uuid) from public;
 grant execute on function service_receipt_term_invoices(uuid) to authenticated;
 
+-- =============================================================================
+-- 24) ORDEM DE SERVIÇO — correções da auditoria (out/2026)
+--   a) update_service_order: só admin e usuario (mecânica e faturamento não editam)
+--   b) update_service_order: QR Code com quebra de linha real (antes gravava "\n" literal)
+--   c) delete_service_authorization: só admin; OS numerada é apagada por marcação
+--      (deleted_at) para o número automático não ser reaproveitado
+-- =============================================================================
+
+-- a) + b)
+create or replace function update_service_order(
+  p_auth_id uuid,
+  p_service_kind service_kind,
+  p_description text,
+  p_value_services numeric,
+  p_value_parts numeric,
+  p_km_in integer,
+  p_budget_ref text default null,
+  p_notes text default null
+) returns void
+language plpgsql security definer set search_path = public, auth as $$
+declare
+  v_a service_authorization%rowtype; v_veh vehicle%rowtype;
+  v_services numeric(12,2) := round(coalesce(p_value_services, 0), 2);
+  v_parts numeric(12,2) := round(coalesce(p_value_parts, 0), 2);
+  v_total numeric(12,2); v_km integer := p_km_in;
+begin
+  if current_user_role() is null or current_user_role() not in ('admin','usuario') then
+    raise exception 'Sem permissão para alterar ordens de serviço.' using errcode = '42501';
+  end if;
+  select * into v_a from service_authorization where id = p_auth_id and deleted_at is null for update;
+  if v_a.id is null then raise exception 'Ordem de serviço não encontrada.'; end if;
+  if v_a.os_number is null then raise exception 'Esta autorização é anterior às ordens de serviço: use a edição antiga.'; end if;
+  if v_a.status <> 'emitida' then raise exception 'Só ordem de serviço emitida pode ser alterada.'; end if;
+  if current_user_role() = 'usuario' and current_user_department_id() is not null then
+    if not exists (select 1 from supplier s where s.id = v_a.supplier_id and s.department_id = current_user_department_id()) then
+      raise exception 'Você só pode alterar ordens de serviço da sua secretaria.' using errcode = '42501';
+    end if;
+  end if;
+  select * into v_veh from vehicle where id = v_a.vehicle_id;
+
+  if v_services < 0 or v_parts < 0 then raise exception 'Os valores não podem ser negativos.'; end if;
+  v_total := v_services + v_parts;
+  if v_total <= 0 then raise exception 'Informe o valor estimado de serviços ou de peças.'; end if;
+
+  if v_veh.vehicle_type_code = 99 then
+    v_km := 99999999;
+  else
+    if v_km is null then raise exception 'Informe o km do veículo na entrada na oficina.'; end if;
+    if v_km < 0 or v_km >= 99999999 then raise exception 'Km na entrada inválido.'; end if;
+    if v_km <> v_a.km_in and v_veh.current_km > 0 and v_km < v_veh.current_km then
+      raise exception 'O km na entrada (%) é menor que o último km registrado do veículo (%).', v_km, v_veh.current_km;
+    end if;
+  end if;
+
+  -- Campos de sempre pela função de sempre (recusa se não estiver emitida)
+  perform update_service_authorization(p_auth_id, p_service_kind, p_description, v_total, p_notes);
+
+  -- QR: troca as linhas Categoria e Serviço. Na substituição do regexp_replace a
+  -- quebra de linha tem de ser real e a barra invertida do texto, escapada.
+  update service_authorization set
+    value_services = v_services, value_parts = v_parts, km_in = v_km,
+    budget_ref = nullif(btrim(coalesce(p_budget_ref, '')), ''),
+    qr_payload = _qr_service_values(
+      regexp_replace(regexp_replace(qr_payload,
+        E'\\nCategoria: [^\\n]*', E'\nCategoria: ' || upper(p_service_kind::text)),
+        E'\\nServiço: [^\\n]*', E'\nServiço: ' || replace(p_description, E'\\', E'\\\\')),
+      v_services, v_parts, v_total)
+  where id = p_auth_id;
+
+  if v_veh.vehicle_type_code <> 99 then
+    update vehicle set current_km = greatest(current_km, v_km) where id = v_a.vehicle_id;
+  end if;
+end;
+$$;
+revoke all on function update_service_order(uuid,service_kind,text,numeric,numeric,integer,text,text) from public;
+grant execute on function update_service_order(uuid,service_kind,text,numeric,numeric,integer,text,text) to authenticated;
+
+-- b) conserta o QR das ordens editadas antes desta correção ("\n" literal → quebra de linha)
+update service_authorization
+   set qr_payload = replace(qr_payload, E'\\n', E'\n')
+ where os_number is not null and position(E'\\n' in qr_payload) > 0;
+
+-- c) Exclusão: só administrador. Autorização antiga continua sendo apagada de
+-- vez; OS numerada recebe deleted_at (e status cancelada, para liberar o número
+-- informado), assim a sequência automática não volta atrás.
+create or replace function delete_service_authorization(p_auth_id uuid) returns void
+language plpgsql security definer set search_path = public, auth as $$
+declare v_a service_authorization%rowtype;
+begin
+  if current_user_role() is null or current_user_role() <> 'admin' then
+    raise exception 'Só o administrador pode excluir ordens de serviço.' using errcode = '42501';
+  end if;
+  select * into v_a from service_authorization where id = p_auth_id and deleted_at is null for update;
+  if v_a.id is null then raise exception 'Autorização não encontrada'; end if;
+  if exists (select 1 from service_authorization c where c.parent_id = p_auth_id and c.deleted_at is null) then
+    raise exception 'Esta ordem de serviço é origem de uma OS complementar e não pode ser excluída.';
+  end if;
+  if exists (select 1 from service_receipt_term t where t.service_authorization_id = p_auth_id) then
+    raise exception 'Esta ordem de serviço tem Termo de Recebimento e não pode ser excluída.';
+  end if;
+  if v_a.os_number is null then
+    delete from service_authorization where id = p_auth_id;
+    return;
+  end if;
+  if exists (select 1 from maintenance m where m.authorization_id = p_auth_id and m.deleted_at is null) then
+    raise exception 'Esta ordem de serviço tem manutenção registrada. Exclua a manutenção antes.';
+  end if;
+  update service_authorization
+     set deleted_at = now(),
+         status = 'cancelada',
+         cancel_reason = coalesce(cancel_reason, 'Excluída pelo administrador'),
+         canceled_by = coalesce(canceled_by, auth.uid()),
+         canceled_at = coalesce(canceled_at, now())
+   where id = p_auth_id;
+end;
+$$;
+revoke all on function delete_service_authorization(uuid) from public;
+grant execute on function delete_service_authorization(uuid) to authenticated;
+
 -- Reload do schema cache do PostgREST
 notify pgrst, 'reload schema';

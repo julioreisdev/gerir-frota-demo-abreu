@@ -97,7 +97,7 @@ export async function openServiceTermModal(order, onDone) {
 
   const invoiceRowHTML = (inv, i) => `
     <div class="inv-row" data-inv="${i}">
-      <div class="field">
+      <div class="field inv-kind">
         <label class="field-label">Tipo</label>
         <select class="select" data-k="kind">
           <option value="servico" ${inv.kind === 'servico' ? 'selected' : ''}>Serviço</option>
@@ -108,27 +108,27 @@ export async function openServiceTermModal(order, onDone) {
         <label class="field-label">Fornecedor</label>
         <select class="select" data-k="supplier_id">${supplierOptions(inv.supplier_id)}</select>
       </div>
-      <div class="field inv-other" ${inv.supplier_id ? 'hidden' : ''}>
+      <div class="field inv-other inv-name" ${inv.supplier_id ? 'hidden' : ''}>
         <label class="field-label">Nome do fornecedor</label>
         <input class="input" data-k="supplier_name" maxlength="120" value="${esc(inv.supplier_name)}" placeholder="Razão social">
       </div>
-      <div class="field inv-other" ${inv.supplier_id ? 'hidden' : ''}>
+      <div class="field inv-other inv-cnpj" ${inv.supplier_id ? 'hidden' : ''}>
         <label class="field-label">CNPJ</label>
         <input class="input" data-k="supplier_cnpj" inputmode="numeric" maxlength="18" value="${esc(inv.supplier_cnpj)}" placeholder="00.000.000/0000-00">
       </div>
-      <div class="field">
+      <div class="field inv-number">
         <label class="field-label">Nota nº</label>
         <input class="input" data-k="invoice_number" maxlength="30" value="${esc(inv.invoice_number)}" placeholder="ex: 512">
       </div>
-      <div class="field">
+      <div class="field inv-series">
         <label class="field-label">Série</label>
         <input class="input" data-k="invoice_series" maxlength="10" value="${esc(inv.invoice_series)}" placeholder="opcional">
       </div>
-      <div class="field">
+      <div class="field inv-date">
         <label class="field-label">Data</label>
         <input class="input" type="date" data-k="invoice_date" min="${esc(order.date)}" max="${today}" value="${esc(inv.invoice_date)}">
       </div>
-      <div class="field">
+      <div class="field inv-amount">
         <label class="field-label">Valor (R$)</label>
         <input class="input" type="number" inputmode="decimal" step="0.01" min="0.01" data-k="amount" value="${esc(inv.amount)}" placeholder="0,00">
       </div>

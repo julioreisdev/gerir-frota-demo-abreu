@@ -2821,23 +2821,35 @@ input[type="month"]::-webkit-calendar-picker-indicator {
 @media (max-width: 360px) {
   :root { --s-4: 12px; --s-5: 16px; --s-6: 20px; }
   .login-card { padding: var(--s-5) var(--s-4); }
-  .page { padding: var(--s-3); }
+  /* o shorthand não pode engolir a reserva da barra inferior */
+  .page { padding: var(--s-3) var(--s-3) calc(var(--bottom-nav-h) + env(safe-area-inset-bottom) + var(--s-6)); }
   .topbar { padding: 0 var(--s-3); }
   .sidebar { width: min(260px, 90vw); }
   .page-title { font-size: 18px; }
 }
 
-/* ---- Termo de Recebimento de Serviço › notas fiscais (modal) ---- */
-.inv-row { display: grid; grid-template-columns: 100px 1.4fr 1fr 150px 100px 80px 140px 120px 36px; gap: var(--s-2); align-items: start; padding: var(--s-2) 0; border-bottom: 1px dashed var(--border); }
+/* ---- Termo de Recebimento de Serviço › notas fiscais (modal) ----
+   Grade de 12 colunas com posição explícita por classe: os campos "Outro"
+   escondidos não deslocam os demais. Linha 1: tipo + fornecedor (+ nome e
+   CNPJ quando digitado); linha 2: nota, série, data, valor e remover. ---- */
+.inv-row { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: var(--s-2); align-items: start; padding: var(--s-2) 0; border-bottom: 1px dashed var(--border); }
 .inv-row .field { margin: 0; min-width: 0; }
 .inv-row .field[hidden] { display: none; }
-.inv-row .inv-remove { align-self: end; padding-bottom: 2px; }
+.inv-row .inv-kind { grid-column: span 3; }
+.inv-row .inv-supplier { grid-column: span 9; }
+.inv-row .inv-name { grid-column: span 7; }
+.inv-row .inv-cnpj { grid-column: span 5; }
+.inv-row .inv-number { grid-column: span 3; }
+.inv-row .inv-series { grid-column: span 2; }
+.inv-row .inv-date { grid-column: span 3; }
+.inv-row .inv-amount { grid-column: span 3; }
+.inv-row .inv-remove { grid-column: span 1; align-self: end; justify-self: end; padding-bottom: 2px; }
 .st-inv-foot { display: flex; justify-content: space-between; align-items: center; gap: var(--s-3); margin-top: var(--s-3); flex-wrap: wrap; }
 .st-total { font-size: 13.5px; }
 .st-total strong { font-size: 15px; }
-@media (max-width: 1024px) {
+@media (max-width: 600px) {
   .inv-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .inv-row .inv-supplier { grid-column: 1 / -1; }
-  .inv-row .inv-remove { grid-column: 1 / -1; justify-self: end; }
+  .inv-row .inv-kind, .inv-row .inv-supplier, .inv-row .inv-name, .inv-row .inv-cnpj { grid-column: 1 / -1; }
+  .inv-row .inv-number, .inv-row .inv-series, .inv-row .inv-date, .inv-row .inv-amount { grid-column: span 1; }
+  .inv-row .inv-remove { grid-column: 1 / -1; }
 }
-@media (max-width: 600px) { .inv-row { grid-template-columns: 1fr; } }
