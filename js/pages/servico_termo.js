@@ -9,6 +9,7 @@ import { supabase } from '../supabase.js';
 import {
   esc, toast, fmtDate, fmtMoney, openModal, closeModal, formatPlate,
   fmtCPF, maskCPF, isValidCPF, onlyDigits, fmtCNPJ, maskCNPJ, isValidCNPJ, supplierOptionLabel,
+  isMissingColumn, isMissingRelation,
 } from '../ui.js';
 import { icons } from '../icons.js';
 import { localToday, billingError, withTimeout, toCenti, fmtCents, fmtAmount, normOrdinance } from '../billing.js';
@@ -537,21 +538,24 @@ export function openServiceTermHistoryModal(order, terms) {
   }));
 }
 
-/** Termos de serviço por OS: { byOrder: Map(os_id → [termos]), available }.
- *  available = false quando o banco ainda não tem a tabela (Parte 3 não aplicada). */
+/** Termos de serviço por OS: { byOrder: Map(os_id → [termos]), available, error }.
+ *  available = false só quando o banco ainda não tem a tabela (Parte 3 não aplicada).
+ *  Qualquer outro erro (rede, permissão, tempo) mantém o fluxo novo e volta em `error`,
+ *  para a tela avisar em vez de liberar a conclusão sem termo. */
 export async function loadServiceTerms() {
+  const empty = (available, error) => ({ byOrder: new Map(), available, error: error || null });
   try {
     const r = await supabase.from('service_receipt_term')
       .select('id, service_authorization_id, number, status, issue_date, delivery_date, km_out, total_amount, commitment_number, fiscal_name, cancel_reason, canceled_at, created_at')
       .order('created_at', { ascending: false });
-    if (r.error) return { byOrder: new Map(), available: false };
+    if (r.error) return empty(!(isMissingRelation(r.error) || isMissingColumn(r.error)), r.error);
     const byOrder = new Map();
     (r.data || []).forEach(t => {
       if (!byOrder.has(t.service_authorization_id)) byOrder.set(t.service_authorization_id, []);
       byOrder.get(t.service_authorization_id).push(t);
     });
-    return { byOrder, available: true };
-  } catch { return { byOrder: new Map(), available: false }; }
+    return { byOrder, available: true, error: null };
+  } catch (e) { return empty(true, e); }
 }
 
 /** Notas de todos os termos (para busca por nº de nota): Map(term_id → [{invoice_number, invoice_digits, supplier_name, kind}]). */

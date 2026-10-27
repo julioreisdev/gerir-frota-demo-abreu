@@ -164,6 +164,7 @@ async function loadAll() {
   if (m.error && isMissingColumn(m.error)) { hasOS = false; m = await manQuery('', 'number'); }
   if (ea.error && isMissingColumn(ea.error)) { hasOS = false; ea = await eaQuery(''); }
   _hasTerms = hasTermCols && hasOS && t.available;
+  if (t.error && t.available) toast('Falha ao carregar os termos de serviço: ' + billingError(t.error), 'error', 7000);
   _termById = new Map();
   t.byOrder.forEach(list => list.forEach(x => _termById.set(x.id, x)));
   _invoices = inv;
@@ -325,6 +326,7 @@ function termCell(a) {
     <span class="of-nowrap"><strong class="of-mono">${esc(term.number)}</strong> · ${esc(fmtDate(term.issue_date))}${canceled ? ' <span class="badge badge-danger">Cancelado</span>' : ''}</span>
     ${notes.length ? `<span class="of-sub">NF ${esc(notes.join(', '))}</span>` : ''}
     <span class="of-sub of-amount">${fmtMoney(term.total_amount)}</span>
+    ${canceled ? '' : '<span class="of-sub" style="white-space:normal">Para alterar ou excluir, cancele o termo em Ordens de Serviço.</span>'}
   </div>`;
 }
 
@@ -483,8 +485,10 @@ function openManModal(id, fromAuth = null) {
   }
 
   const isLinked = !!initial.authorization_id;
-  // Justificativa: obrigatória no registro sem OS quando o banco já tem a coluna
-  const needReason = _hasTerms && !isLinked;
+  // Justificativa: campo do registro sem OS quando o banco já tem a coluna.
+  // Obrigatória no registro novo; registro antigo (sem justificativa) continua editável sem ela.
+  const showReason = _hasTerms && !isLinked;
+  const needReason = showReason && (!editing || !!initial.manual_reason);
   const vehOptions = '<option value="">— Selecione —</option>' +
     _vehicles.map(v => `<option value="${v.id}" ${initial.vehicle_id === v.id ? 'selected' : ''}>${esc(formatPlate(v.plate))} — ${esc(v.model)} (${esc(v.department?.acronym || '—')})</option>`).join('');
   // Fornecedor: linked → mostra só o item fixo; senão → placeholder que
@@ -505,9 +509,9 @@ function openManModal(id, fromAuth = null) {
       ${isLinked ? `
         <div class="alert" style="background:var(--primary-tint);border-left:3px solid var(--primary);padding:var(--s-3) var(--s-4);border-radius:var(--r-md);margin-bottom:var(--s-4);font-size:13px">
           <strong>Vinculado à autorização</strong>${initial._authNumber ? ` <span style="font-family:ui-monospace,monospace;color:var(--primary)">${esc(initial._authNumber)}</span>` : ''}
-        </div>` : (needReason ? `
+        </div>` : (showReason ? `
         <div class="alert" style="background:var(--warning-bg);border-left:3px solid var(--warning);padding:var(--s-3) var(--s-4);border-radius:var(--r-md);margin-bottom:var(--s-4);font-size:13px">
-          <strong>Registro sem ordem de serviço.</strong> Não gera termo de recebimento. Informe a justificativa.
+          <strong>Registro sem ordem de serviço.</strong> Não gera termo de recebimento.${needReason ? ' Informe a justificativa.' : ''}
         </div>` : '')}
       <div class="form-grid">
         <div class="field">
@@ -552,10 +556,10 @@ function openManModal(id, fromAuth = null) {
           <label class="field-label">Descrição do serviço <span class="req">*</span></label>
           <textarea class="textarea" name="description" rows="3" required minlength="3">${esc(initial.description || '')}</textarea>
         </div>
-        ${needReason ? `
+        ${showReason ? `
         <div class="field col-full">
-          <label class="field-label">Justificativa do registro manual <span class="req">*</span></label>
-          <textarea class="textarea" name="manual_reason" rows="2" required minlength="${MIN_REASON}" placeholder="Por que este serviço não teve ordem de serviço?">${esc(initial.manual_reason || '')}</textarea>
+          <label class="field-label">Justificativa do registro manual ${needReason ? '<span class="req">*</span>' : '<span class="nof-opt">(opcional neste registro antigo)</span>'}</label>
+          <textarea class="textarea" name="manual_reason" rows="2" ${needReason ? 'required' : ''} minlength="${MIN_REASON}" placeholder="Por que este serviço não teve ordem de serviço?">${esc(initial.manual_reason || '')}</textarea>
           <div class="field-help">Mostrada na lista e no Excel. Mínimo de ${MIN_REASON} caracteres.</div>
         </div>` : ''}
         <div class="field col-full">
@@ -600,10 +604,10 @@ function openManModal(id, fromAuth = null) {
   rebuildSupplierOptions(initial.supplier_id || '');
 
   m.querySelector('[data-cancel]').addEventListener('click', closeModal);
-  m.querySelector('#man-save-btn').addEventListener('click', () => saveMan(id, initial, needReason));
+  m.querySelector('#man-save-btn').addEventListener('click', () => saveMan(id, initial, showReason, needReason));
 }
 
-async function saveMan(id, initial, needReason) {
+async function saveMan(id, initial, showReason, needReason) {
   const form = document.getElementById('man-form');
   const errBox = document.getElementById('man-errors');
   errBox.style.display = 'none';
@@ -615,7 +619,7 @@ async function saveMan(id, initial, needReason) {
     errBox.innerHTML = '⚠️ Selecione veículo e mecânica.'; errBox.style.display = 'block'; return;
   }
   const reason = (v.manual_reason || '').trim();
-  if (needReason && reason.length < MIN_REASON) {
+  if ((needReason || reason) && reason.length < MIN_REASON) {
     errBox.innerHTML = `⚠️ Informe a justificativa do registro manual (mínimo de ${MIN_REASON} caracteres).`; errBox.style.display = 'block'; return;
   }
   const payload = {
@@ -631,7 +635,7 @@ async function saveMan(id, initial, needReason) {
     responsible_name: v.responsible_name,
     notes: v.notes || null,
   };
-  if (needReason) payload.manual_reason = reason;
+  if (showReason) payload.manual_reason = reason || null;
   const btn = document.getElementById('man-save-btn');
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Salvando...';
   try {

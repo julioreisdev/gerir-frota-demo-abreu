@@ -98,6 +98,9 @@ export function maskCEP(v) {
 /** Erro de coluna inexistente: o código novo subiu antes do apply.sql. */
 export const isMissingColumn = (err) =>
   err?.code === '42703' || err?.code === 'PGRST204' || /column .* does not exist|could not find the .* column/i.test(err?.message || '');
+/** Erro de tabela inexistente: o código novo subiu antes do apply.sql. */
+export const isMissingRelation = (err) =>
+  err?.code === '42P01' || err?.code === 'PGRST205' || /relation .* does not exist|could not find the table/i.test(err?.message || '');
 
 /** Label rico para options/dropdowns de fornecedor.
  *  Depois que passamos a permitir mesmo CNPJ em secretarias diferentes,

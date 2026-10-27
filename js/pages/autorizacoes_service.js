@@ -188,6 +188,7 @@ async function loadAll() {
   _hasDrivers = drv.available && hasDriverCols;
   _numbering = (!e.error && e.data?.service_order_numbering) || 'auto';
   _hasTerms = t.available && _hasOS;
+  if (t.error && t.available) toast('Falha ao carregar os termos de serviço: ' + billingError(t.error), 'error', 7000);
   if (a.error) { toast('Falha ao carregar ordens de serviço: ' + a.error.message, 'error'); _items = []; }
   else _items = a.data || [];
   _vehicles = v.data || [];
@@ -342,6 +343,7 @@ function srvRow(a) {
   const termCell = !showTerms() ? '' : `<td data-label="Termo">${
     term ? `<div class="cell-stack">
         <span class="of-nowrap"><strong class="of-mono">${esc(term.number)}</strong> · ${esc(fmtDate(term.issue_date))}</span>
+        ${(() => { const nfs = (_invoices.get(term.id) || []).map(i => i.invoice_number).filter(Boolean); return nfs.length ? `<span class="of-sub">NF ${esc(nfs.join(', '))}</span>` : ''; })()}
         <span class="of-sub of-amount">${fmtMoney(term.total_amount)}</span>
       </div>`
     : (emitida && os && canWrite()) ? `<button class="btn btn-outline btn-sm of-act" data-act="term" data-id="${a.id}"
@@ -393,6 +395,15 @@ function srvRow(a) {
 // =============================================================================
 // MODAL: EMISSÃO / EDIÇÃO
 // =============================================================================
+/** "nº 318, de 27/10/2026" → { number: '318', date: '2026-10-27' }. Texto fora do padrão vira só o número. */
+function parseBudget(ref) {
+  const s = String(ref || '').trim();
+  if (!s) return { number: '', date: '' };
+  const m = s.match(/^n[ºo°.]?\s*(.+?)(?:,\s*de\s*(\d{2})\/(\d{2})\/(\d{4}))?$/i);
+  if (!m) return { number: s, date: '' };
+  return { number: m[1].trim(), date: m[2] ? `${m[4]}-${m[3]}-${m[2]}` : '' };
+}
+
 function openSrvModal(id) {
   const a = id ? _items.find(x => x.id === id) : null;
   if (a && a.status !== 'emitida') {
@@ -501,10 +512,15 @@ function openOrderModal(a) {
           <input class="input" name="os_number" id="srv-number" maxlength="30" autocomplete="off" placeholder="em branco = automático">
           <span class="field-help" id="srv-number-hint"></span>
         </div>` : ''}`}
-        <div class="field ${editing ? '' : (informed ? 'col-full' : '')}">
-          <label class="field-label">Orçamento da mecânica <span class="nof-opt">(opcional)</span></label>
-          <input class="input" name="budget_ref" maxlength="60" value="${esc(a?.budget_ref || '')}" placeholder="ex: nº 318, de 27/10/2026">
+        ${(() => { const b = parseBudget(a?.budget_ref); return `
+        <div class="field">
+          <label class="field-label">Orçamento da mecânica: nº <span class="nof-opt">(opcional)</span></label>
+          <input class="input" name="budget_number" maxlength="30" value="${esc(b.number)}" placeholder="ex: 318">
         </div>
+        <div class="field">
+          <label class="field-label">Orçamento: data <span class="nof-opt">(opcional)</span></label>
+          <input class="input" name="budget_date" type="date" max="${localToday()}" value="${esc(b.date)}">
+        </div>`; })()}
         ${editing ? '' : `
         <div class="field col-full">
           <label class="field-label">OS complementar <span class="nof-opt">(opcional)</span></label>
@@ -636,6 +652,10 @@ async function saveOrder(a) {
   }
   const number = (v.os_number || '').trim();
   if (number && _numbering !== 'opcional') return showErr('Esta cidade numera as ordens de serviço automaticamente. Deixe o número em branco.');
+  const budgetNumber = (v.budget_number || '').trim();
+  if (v.budget_date && !budgetNumber) return showErr('Informe o número do orçamento da mecânica.');
+  if (v.budget_date && v.budget_date > localToday()) return showErr('A data do orçamento não pode ser posterior a hoje.');
+  const budgetRef = budgetNumber ? `nº ${budgetNumber}${v.budget_date ? `, de ${fmtDate(v.budget_date)}` : ''}` : null;
   if (number.length > 30) return showErr('O número da ordem tem no máximo 30 caracteres.');
 
   // Aviso de duplicata na mesma data + veículo (não bloqueia). confirmDialog fecha o modal.
@@ -665,7 +685,7 @@ async function saveOrder(a) {
         p_value_services: services,
         p_value_parts: parts,
         p_km_in: km,
-        p_budget_ref: v.budget_ref || null,
+        p_budget_ref: budgetRef,
         p_notes: v.notes || null,
       }));
       if (r.error) throw r.error;
@@ -691,7 +711,7 @@ async function saveOrder(a) {
         p_notes: v.notes || null,
         p_driver_id: (_hasDrivers && v.driver_id) ? v.driver_id : null,
         p_commitment: (v.commitment || '').trim() || null,
-        p_budget_ref: (v.budget_ref || '').trim() || null,
+        p_budget_ref: budgetRef,
         p_parent_id: v.parent_id || null,
         p_number: number || null,
       }), 30000);

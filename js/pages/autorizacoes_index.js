@@ -4,6 +4,7 @@ import { renderServiceTab } from './autorizacoes_service.js';
 import { icons } from '../icons.js';
 import { getProfile } from '../auth.js';
 import { supabase } from '../supabase.js';
+import { currentQuery } from '../router.js';
 
 let _currentTab = 'fueling'; // 'fueling' | 'service'
 let _availableTabs = null;    // null = ainda não resolvido
@@ -27,6 +28,9 @@ async function resolveAvailableTabs() {
 
 export async function renderAutorizacoes() {
   _availableTabs = await resolveAvailableTabs();
+  // Link direto para uma aba (ex.: alerta do Painel → #/autorizacoes?tab=service)
+  const wanted = currentQuery().tab;
+  if (wanted === 'fueling' || wanted === 'service') _currentTab = wanted;
   if (!_availableTabs.includes(_currentTab)) _currentTab = _availableTabs[0];
 
   const tabHTML = (key, icon, label) => _availableTabs.includes(key)

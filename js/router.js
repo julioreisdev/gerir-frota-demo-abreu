@@ -13,7 +13,15 @@ export function setOnChange(fn) { _onChange = fn; }
 
 export function currentPath() {
   const h = location.hash || '#/';
-  return h.startsWith('#') ? h.slice(1) : h;
+  const p = h.startsWith('#') ? h.slice(1) : h;
+  return p.split('?')[0];
+}
+
+/** Parâmetros depois de "?" no hash (ex.: #/autorizacoes?tab=service → { tab: 'service' }). */
+export function currentQuery() {
+  const h = location.hash || '';
+  const i = h.indexOf('?');
+  return i === -1 ? {} : Object.fromEntries(new URLSearchParams(h.slice(i + 1)));
 }
 
 export function navigate(path, replace = false) {

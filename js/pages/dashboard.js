@@ -360,7 +360,7 @@ function renderAlerts() {
       icon: `<span style="display:inline-flex;width:20px;height:20px">${icons.wrench}</span>`,
       title: `${oldOS.length} ordem(ns) de serviço emitida(s) há +30 dias sem termo de recebimento`,
       msg: `Gere o termo com as notas fiscais ou cancele a ordem. Ex.: OS ${oldOS.slice(0, 3).map(o => o.os_number).join(', ')}${oldOS.length > 3 ? '…' : ''}.`,
-      link: '#/autorizacoes',
+      link: '#/autorizacoes?tab=service',
     });
   }
 
