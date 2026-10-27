@@ -13,9 +13,10 @@ import { icons } from '../icons.js';
 import { getProfile, isAdmin } from '../auth.js';
 import QRCode from 'https://esm.sh/qrcode@1.5.3';
 import { openPrintTab, openThermalPDF, hasChosenThermalWidth, askThermalWidth } from '../thermal.js';
-import { localToday, billingError, withTimeout, fmtAmount } from '../billing.js';
+import { localToday, billingError, withTimeout, fmtAmount, nfMatches } from '../billing.js';
 import { loadDriversForPick, driverFieldHTML, mountDriverField } from '../drivers.js';
-import { printServiceOrder, SERVICE_KIND_LABEL } from '../service_docs.js';
+import { printServiceOrder, printServiceReceiptTerm, SERVICE_KIND_LABEL } from '../service_docs.js';
+import { openServiceTermModal, openCancelServiceTermModal, openServiceTermHistoryModal, loadServiceTerms, loadServiceTermInvoices, activeServiceTerm, canceledServiceTerms } from './servico_termo.js';
 
 // Na manutenção, "utilizada" é mostrada como Concluída (o enum é o mesmo do abastecimento)
 const STATUS_LABEL = { emitida: 'Emitida', utilizada: 'Concluída', cancelada: 'Cancelada' };
@@ -35,6 +36,10 @@ let _hasDrivers = false;
 let _hasOS = true;
 // 'auto' (só automática) ou 'opcional' (aceita nº informado), da entidade
 let _numbering = 'auto';
+// Termos de serviço por OS (Parte 3). _hasTerms = false: banco sem a tabela, a OS é concluída pelo registro antigo.
+let _terms = new Map();
+let _invoices = new Map();
+let _hasTerms = false;
 
 const isFornecedor = () => getProfile()?.role === 'fornecedor';
 const canWrite = () => ['admin', 'usuario'].includes(getProfile()?.role);
@@ -157,7 +162,7 @@ async function loadAll() {
       department_acronym_snapshot, supplier_trade_name_snapshot,
       qr_payload, created_at${extra}
     `).is('deleted_at', null).order('date', { ascending: false }).order('number', { ascending: false });
-  let [a, v, s, drv, e] = await Promise.all([
+  let [a, v, s, drv, e, t, inv] = await Promise.all([
     srvQuery(DRIVER_COLS + OS_COLS),
     supabase.from('vehicle').select(`
       id, plate, model, brand, current_km, vehicle_type_code,
@@ -170,7 +175,10 @@ async function loadAll() {
     `).in('kind', ['mecanica', 'ambos']).order('legal_name'),
     isFornecedor() ? Promise.resolve({ drivers: [], available: false }) : loadDriversForPick(),
     supabase.from('entity').select('service_order_numbering').maybeSingle(),
+    isFornecedor() ? Promise.resolve({ byOrder: new Map(), available: false }) : loadServiceTerms(),
+    isFornecedor() ? Promise.resolve(new Map()) : loadServiceTermInvoices(),
   ]);
+  _terms = t.byOrder; _invoices = inv;
   // Banco em versão anterior: sem as colunas da OS; depois, sem as do motorista
   _hasOS = true;
   let hasDriverCols = true;
@@ -179,6 +187,7 @@ async function loadAll() {
   _drivers = drv.drivers;
   _hasDrivers = drv.available && hasDriverCols;
   _numbering = (!e.error && e.data?.service_order_numbering) || 'auto';
+  _hasTerms = t.available && _hasOS;
   if (a.error) { toast('Falha ao carregar ordens de serviço: ' + a.error.message, 'error'); _items = []; }
   else _items = a.data || [];
   _vehicles = v.data || [];
@@ -200,6 +209,8 @@ function applyFilters() {
     if (_filter.driver === 'none' && a.driver_name_snapshot) return false;
     if (_filter.driver && _filter.driver !== 'none' && a.driver_name_snapshot !== _filter.driver) return false;
     if (!t) return true;
+    // nº da nota fiscal do termo: só dígitos, sem zeros à esquerda
+    if ((_terms.get(a.id) || []).some(x => (_invoices.get(x.id) || []).some(i => nfMatches(i.invoice_number, _filter.search)))) return true;
     // nº da OS com ou sem a barra (001/2026 ou 0012026); código MAN com ou sem hífens
     const osNo = String(a.os_number || '').toLowerCase();
     if (osNo && (osNo.includes(t) || (tNum && osNo.replace(/[^0-9a-z]/g, '').includes(tNum)))) return true;
@@ -255,6 +266,7 @@ function renderTable() {
             ${_hasOS && !isFornecedor() ? '<th>Empenho</th>' : ''}
             <th>Responsável</th>
             <th>Situação</th>
+            ${showTerms() ? '<th>Termo</th>' : ''}
             <th class="actions-col">Ações</th>
           </tr>
         </thead>
@@ -270,7 +282,24 @@ function renderTable() {
   box.querySelectorAll('[data-act="cancel"]').forEach(b => b.addEventListener('click', () => cancelSrv(b.dataset.id)));
   box.querySelectorAll('[data-act="delete"]').forEach(b => b.addEventListener('click', () => deleteSrv(b.dataset.id)));
   box.querySelectorAll('[data-act="empenho"]').forEach(b => b.addEventListener('click', () => openCommitmentModal(b.dataset.id)));
+  box.querySelectorAll('[data-act="term"]').forEach(b => b.addEventListener('click', () => {
+    const a = _items.find(x => x.id === b.dataset.id); if (a) openServiceTermModal(a, reload);
+  }));
+  box.querySelectorAll('[data-act="term-pdf"]').forEach(b => b.addEventListener('click', async () => {
+    const term = activeServiceTerm(_terms.get(b.dataset.id)); if (!term) return;
+    b.disabled = true; try { await printServiceReceiptTerm(term.id); } finally { b.disabled = false; }
+  }));
+  box.querySelectorAll('[data-act="term-cancel"]').forEach(b => b.addEventListener('click', () => {
+    const a = _items.find(x => x.id === b.dataset.id); const term = activeServiceTerm(_terms.get(b.dataset.id));
+    if (a && term) openCancelServiceTermModal(a, term, reload);
+  }));
+  box.querySelectorAll('[data-act="term-history"]').forEach(b => b.addEventListener('click', () => {
+    const a = _items.find(x => x.id === b.dataset.id); if (a) openServiceTermHistoryModal(a, _terms.get(a.id) || []);
+  }));
 }
+
+const showTerms = () => _hasTerms && !isFornecedor();
+async function reload() { await loadAll(); renderTable(); }
 
 function parentNumberOf(a) {
   if (!a.parent_id) return '';
@@ -306,6 +335,18 @@ function srvRow(a) {
       ${emitida && canWrite() ? `<button class="btn btn-ghost btn-icon btn-sm" data-act="empenho" data-id="${a.id}"
           title="${a.commitment_number ? 'Alterar empenho' : 'Informar empenho'}">${icons.edit}</button>` : ''}
     </div>`;
+  const terms = _terms.get(a.id) || [];
+  const term = activeServiceTerm(terms), oldTerms = canceledServiceTerms(terms);
+  // OS numerada com o termo no banco: conclui pelo termo; autorização antiga (ou banco antigo): registro de manutenção
+  const viaTerm = os && _hasTerms;
+  const termCell = !showTerms() ? '' : `<td data-label="Termo">${
+    term ? `<div class="cell-stack">
+        <span class="of-nowrap"><strong class="of-mono">${esc(term.number)}</strong> · ${esc(fmtDate(term.issue_date))}</span>
+        <span class="of-sub of-amount">${fmtMoney(term.total_amount)}</span>
+      </div>`
+    : (emitida && os && canWrite()) ? `<button class="btn btn-outline btn-sm of-act" data-act="term" data-id="${a.id}"
+        title="Gerar o Termo de Recebimento de Serviço desta ordem">${icons.fileCheck}<span>Gerar termo</span></button>`
+    : '<span class="of-sub">—</span>'}</td>`;
   return `
     <tr ${a.status === 'cancelada' ? 'class="is-canceled"' : ''}>
       <td data-label="Ordem">${ordem}</td>
@@ -329,15 +370,20 @@ function srvRow(a) {
           ${a.status === 'cancelada' && a.cancel_reason ? `<span class="of-sub of-reason">${esc(a.cancel_reason)}</span>` : ''}
         </div>
       </td>
+      ${termCell}
       <td class="actions-col">
         <div class="actions-row">
-          <button class="btn btn-ghost btn-icon btn-sm" data-act="conclude"      data-id="${a.id}" title="Concluir (registrar manutenção)" ${emitida && !isFornecedor() ? '' : 'disabled'} style="color:var(--success)">${icons.check}</button>
+          ${viaTerm ? `
+          ${term && showTerms() ? `<button class="btn btn-ghost btn-icon btn-sm" data-act="term-pdf" data-id="${a.id}" title="Abrir o Termo de Recebimento em PDF">${icons.fileCheck}</button>` : ''}
+          ${oldTerms.length && showTerms() ? `<button class="btn btn-ghost btn-icon btn-sm" data-act="term-history" data-id="${a.id}" title="${oldTerms.length} termo(s) cancelado(s) desta ordem">${icons.history}</button>` : ''}`
+          : `<button class="btn btn-ghost btn-icon btn-sm" data-act="conclude" data-id="${a.id}" title="Concluir (registrar manutenção)" ${emitida && !isFornecedor() ? '' : 'disabled'} style="color:var(--success)">${icons.check}</button>`}
           <button class="btn btn-ghost btn-icon btn-sm" data-act="qr"            data-id="${a.id}" title="Ver QR Code">${icons.qrcode}</button>
           <button class="btn btn-ghost btn-icon btn-sm" data-act="print-a4"      data-id="${a.id}" title="Imprimir A4">${icons.printer}</button>
           <button class="btn btn-ghost btn-icon btn-sm" data-act="print-thermal" data-id="${a.id}" title="Imprimir térmica (PDF 58/80mm)">${icons.receipt}</button>
           ${isFornecedor() ? '' : `
           <button class="btn btn-ghost btn-icon btn-sm" data-act="edit"          data-id="${a.id}" title="Editar" ${emitida ? '' : 'disabled'}>${icons.edit}</button>
           <button class="btn btn-ghost btn-icon btn-sm" data-act="cancel"        data-id="${a.id}" title="Cancelar" ${emitida ? '' : 'disabled'} style="color:var(--warning)">${icons.ban}</button>
+          ${term && canWrite() ? `<button class="btn btn-ghost btn-icon btn-sm" data-act="term-cancel" data-id="${a.id}" title="Cancelar o termo de recebimento" style="color:var(--danger)">${icons.ban}</button>` : ''}
           ${isAdmin() ? `<button class="btn btn-ghost btn-icon btn-sm" data-act="delete"        data-id="${a.id}" title="Excluir" style="color:var(--danger)">${icons.trash}</button>` : ''}`}
         </div>
       </td>

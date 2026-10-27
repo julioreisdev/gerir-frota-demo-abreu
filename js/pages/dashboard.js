@@ -25,6 +25,7 @@ let _fAuth = [];
 let _sAuth = [];
 let _users = [];
 let _unbilled = null;   // resumo do faturamento pendente
+let _osOpen = [];       // ordens de serviço emitidas sem termo (nº da OS e data)
 let _drivers = [];      // motoristas ativos (validade da CNH)
 let _filter = { from: '', to: '' };
 let _charts = [];
@@ -110,6 +111,16 @@ async function loadAll() {
     try {
       const r = await supabase.from('driver').select('id, full_name, cnh_expiry').eq('active', true);
       if (!r.error) _drivers = r.data || [];
+    } catch { /* sem aviso */ }
+  }
+
+  // Ordens de serviço emitidas e ainda sem termo. Tolerante: banco sem a coluna, sem o aviso.
+  _osOpen = [];
+  if (['admin', 'usuario'].includes(getProfile()?.role)) {
+    try {
+      const r = await supabase.from('service_authorization').select('id, os_number, date')
+        .not('os_number', 'is', null).eq('status', 'emitida').is('deleted_at', null);
+      if (!r.error) _osOpen = r.data || [];
     } catch { /* sem aviso */ }
   }
 
@@ -338,6 +349,18 @@ function renderAlerts() {
       title: `${oldMan.length} manutenção(ões) aberta(s) há +30 dias`,
       msg: 'Verifique status e atualize ou conclua.',
       link: '#/manutencoes',
+    });
+  }
+
+  // 4b) Ordens de serviço emitidas há +30 dias sem Termo de Recebimento de Serviço
+  const oldOS = _osOpen.filter(o => o.date < thirtyStr);
+  if (oldOS.length > 0) {
+    alerts.push({
+      level: 'warning',
+      icon: `<span style="display:inline-flex;width:20px;height:20px">${icons.wrench}</span>`,
+      title: `${oldOS.length} ordem(ns) de serviço emitida(s) há +30 dias sem termo de recebimento`,
+      msg: `Gere o termo com as notas fiscais ou cancele a ordem. Ex.: OS ${oldOS.slice(0, 3).map(o => o.os_number).join(', ')}${oldOS.length > 3 ? '…' : ''}.`,
+      link: '#/autorizacoes',
     });
   }
 

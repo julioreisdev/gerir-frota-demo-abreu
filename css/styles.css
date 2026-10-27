@@ -2848,3 +2848,18 @@ input[type="month"]::-webkit-calendar-picker-indicator {
   .sidebar { width: min(260px, 90vw); }
   .page-title { font-size: 18px; }
 }
+
+/* ---- Termo de Recebimento de Serviço › notas fiscais (modal) ---- */
+.inv-row { display: grid; grid-template-columns: 100px 1.4fr 1fr 150px 100px 80px 140px 120px 36px; gap: var(--s-2); align-items: start; padding: var(--s-2) 0; border-bottom: 1px dashed var(--border); }
+.inv-row .field { margin: 0; min-width: 0; }
+.inv-row .field[hidden] { display: none; }
+.inv-row .inv-remove { align-self: end; padding-bottom: 2px; }
+.st-inv-foot { display: flex; justify-content: space-between; align-items: center; gap: var(--s-3); margin-top: var(--s-3); flex-wrap: wrap; }
+.st-total { font-size: 13.5px; }
+.st-total strong { font-size: 15px; }
+@media (max-width: 1024px) {
+  .inv-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .inv-row .inv-supplier { grid-column: 1 / -1; }
+  .inv-row .inv-remove { grid-column: 1 / -1; justify-self: end; }
+}
+@media (max-width: 600px) { .inv-row { grid-template-columns: 1fr; } }

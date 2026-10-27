@@ -1,30 +1,46 @@
 import { pageRoot, pageHeader } from '../shell.js';
 import { supabase } from '../supabase.js';
-import { esc, fmtDate, fmtMoney, toast, openModal, closeModal, confirmDialog, formValues, formatPlate, supplierOptionLabel, supplierCellHTML } from '../ui.js';
+import { esc, fmtDate, fmtMoney, toast, openModal, closeModal, confirmDialog, formValues, formatPlate, supplierOptionLabel, supplierCellHTML, isMissingColumn } from '../ui.js';
 import { icons } from '../icons.js';
 import { getProfile, isAdmin } from '../auth.js';
+import { localToday, nfMatches, billingError } from '../billing.js';
+import { exportXLSX, timestampFilename } from '../export.js';
+import { openServiceTermModal, loadServiceTerms, loadServiceTermInvoices } from './servico_termo.js';
+import { printServiceReceiptTerm } from '../service_docs.js';
 
 const KIND_LABEL = { preventiva: 'Preventiva', corretiva: 'Corretiva', sinistro: 'Sinistro', revisao: 'Revisão', outros: 'Outros' };
 const KIND_BADGE = { preventiva: 'badge badge-success', corretiva: 'badge badge-warning', sinistro: 'badge badge-danger', revisao: 'badge', outros: 'badge badge-neutral' };
 const STATUS_LABEL = { aberta: 'Aberta', em_andamento: 'Em andamento', concluida: 'Concluída', cancelada: 'Cancelada' };
 const STATUS_BADGE = { aberta: 'badge badge-warning', em_andamento: 'badge', concluida: 'badge badge-success', cancelada: 'badge badge-danger' };
+const MIN_REASON = 5;
 
 let _items = [];
 let _vehicles = [];
 let _suppliers = [];
 let _depts = [];
 let _emittedAuths = [];
-let _filter = { search: '', vehicle: '', dept: '', supplier: '', kind: '', status: '', month: '' };
+// Termos de serviço (Parte 3/4). _hasTerms = false: banco anterior, fluxo antigo
+// ("Importar autorização", sem justificativa no manual, sem coluna Termo).
+let _termById = new Map();   // term_id → termo
+let _invoices = new Map();   // term_id → [notas]
+let _hasTerms = false;
+let _filter = { search: '', vehicle: '', dept: '', supplier: '', kind: '', status: '', origin: '', month: '' };
+
+const FILTER_IDS = { 'ff-veh': 'vehicle', 'ff-dept': 'dept', 'ff-sup': 'supplier', 'ff-kind': 'kind', 'ff-status': 'status', 'ff-origin': 'origin', 'ff-month': 'month' };
 
 export async function renderManutencoes() {
   pageRoot().innerHTML = `
     ${pageHeader({
       title: 'Manutenções',
-      subtitle: 'Registre serviços executados — a partir de autorização ou avulso.',
+      subtitle: 'Serviços executados — pelo termo da ordem de serviço ou registro avulso.',
       actionsHtml: `
+        <button class="btn btn-outline" id="btn-export-man" title="Exportar lista filtrada (Excel)">
+          <span style="width:16px;height:16px;display:inline-flex">${icons.download}</span>
+          <span>Exportar Excel</span>
+        </button>
         <button class="btn btn-outline" id="btn-import-aut">
-          <span style="width:16px;height:16px;display:inline-flex">${icons.clipboard}</span>
-          <span>Importar autorização</span>
+          <span style="width:16px;height:16px;display:inline-flex">${icons.fileCheck}</span>
+          <span id="btn-import-label">Importar autorização</span>
         </button>
         <button class="btn btn-primary" id="btn-new-man">
           <span style="width:16px;height:16px;display:inline-flex">${icons.plus}</span>
@@ -37,7 +53,7 @@ export async function renderManutencoes() {
         <div class="search ${_filter.search ? 'has-value' : ''}" id="man-search-box">
           ${icons.search}
           <input id="man-search" type="search"
-                 placeholder="Buscar por placa, mecânica, responsável, descrição…"
+                 placeholder="Buscar por placa, mecânica, nº da OS, nota fiscal, descrição…"
                  autocomplete="off" value="${esc(_filter.search)}">
           <button class="clear" id="man-search-clear" aria-label="Limpar busca">${icons.close}</button>
         </div>
@@ -55,6 +71,11 @@ export async function renderManutencoes() {
           <option value="">Todos status</option>
           ${Object.entries(STATUS_LABEL).map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join('')}
         </select>
+        <select class="select chip" id="ff-origin">
+          <option value="">Qualquer origem</option>
+          <option value="os">Com ordem de serviço</option>
+          <option value="manual">Registro manual</option>
+        </select>
         <input class="input chip" type="month" id="ff-month" value="${esc(_filter.month)}">
         <button class="btn btn-ghost btn-sm" id="ff-clear" hidden>Limpar filtros</button>
       </div>
@@ -68,6 +89,7 @@ export async function renderManutencoes() {
 
   document.getElementById('btn-new-man').addEventListener('click', () => openManModal());
   document.getElementById('btn-import-aut').addEventListener('click', () => openImportModal());
+  document.getElementById('btn-export-man').addEventListener('click', exportExcel);
 
   const sBox = document.getElementById('man-search-box');
   const sIn = document.getElementById('man-search');
@@ -79,15 +101,14 @@ export async function renderManutencoes() {
     sBox.classList.toggle('has-value', !!_filter.search);
     renderTable();
   });
-  ['ff-veh', 'ff-dept', 'ff-sup', 'ff-kind', 'ff-status', 'ff-month'].forEach(id => {
-    const key = { 'ff-veh': 'vehicle', 'ff-dept': 'dept', 'ff-sup': 'supplier', 'ff-kind': 'kind', 'ff-status': 'status', 'ff-month': 'month' }[id];
+  Object.entries(FILTER_IDS).forEach(([id, key]) => {
     document.getElementById(id).addEventListener('change', e => {
       _filter[key] = e.target.value; updateClear(); renderTable(); renderStats();
     });
   });
   document.getElementById('ff-clear').addEventListener('click', () => {
-    _filter = { search: _filter.search, vehicle: '', dept: '', supplier: '', kind: '', status: '', month: '' };
-    ['ff-veh', 'ff-dept', 'ff-sup', 'ff-kind', 'ff-status', 'ff-month'].forEach(id => document.getElementById(id).value = '');
+    _filter = { search: _filter.search, vehicle: '', dept: '', supplier: '', kind: '', status: '', origin: '', month: '' };
+    Object.keys(FILTER_IDS).forEach(id => document.getElementById(id).value = '');
     updateClear(); renderTable(); renderStats();
   });
 
@@ -98,18 +119,32 @@ export async function renderManutencoes() {
 }
 
 function updateClear() {
-  const any = _filter.vehicle || _filter.dept || _filter.supplier || _filter.kind || _filter.status || _filter.month;
+  const any = _filter.vehicle || _filter.dept || _filter.supplier || _filter.kind || _filter.status || _filter.origin || _filter.month;
   document.getElementById('ff-clear').hidden = !any;
 }
 
+// =============================================================================
+// CARGA (tolerante ao banco na versão anterior)
+// =============================================================================
+const MAN_BASE = `
+  id, authorization_id, vehicle_id, supplier_id, kind, status,
+  open_date, close_date, km_at_service, description, total_value,
+  responsible_name, notes, created_at`;
+const manQuery = (extra, authCols) => supabase.from('maintenance')
+  .select(`${MAN_BASE}${extra}, authorization:authorization_id(${authCols})`)
+  .is('deleted_at', null).order('open_date', { ascending: false }).order('created_at', { ascending: false });
+
+const EA_BASE = `
+  id, number, date, vehicle_id, supplier_id, service_kind,
+  description, estimated_value, responsible_name,
+  vehicle_plate_snapshot, vehicle_model_snapshot, supplier_trade_name_snapshot`;
+const EA_OS = `, os_number, contract_number_snapshot, value_services, value_parts, km_in, commitment_number`;
+const eaQuery = (extra) => supabase.from('service_authorization').select(`${EA_BASE}${extra}`)
+  .eq('status', 'emitida').is('deleted_at', null).order('date', { ascending: false });
+
 async function loadAll() {
-  const [m, v, s, d, ea] = await Promise.all([
-    supabase.from('maintenance').select(`
-      id, authorization_id, vehicle_id, supplier_id, kind, status,
-      open_date, close_date, km_at_service, description, total_value,
-      responsible_name, notes, created_at,
-      authorization:authorization_id(number)
-    `).is('deleted_at', null).order('open_date', { ascending: false }).order('created_at', { ascending: false }),
+  let [m, v, s, d, ea, t, inv] = await Promise.all([
+    manQuery(', service_term_id, manual_reason', 'number, os_number'),
     supabase.from('vehicle').select(`
       id, plate, model, brand, current_km,
       department_id, department:department_id(acronym, name)
@@ -119,31 +154,37 @@ async function loadAll() {
       department:department_id(acronym, name)
     `).in('kind', ['mecanica', 'ambos']).order('legal_name'),
     supabase.from('department').select('id, acronym, name').order('acronym'),
-    supabase.from('service_authorization').select(`
-      id, number, os_number, date, vehicle_id, supplier_id, service_kind,
-      description, estimated_value, responsible_name,
-      vehicle_plate_snapshot, vehicle_model_snapshot, supplier_trade_name_snapshot
-    `).eq('status', 'emitida').is('deleted_at', null).order('date', { ascending: false }),
+    eaQuery(EA_OS),
+    loadServiceTerms(),
+    loadServiceTermInvoices(),
   ]);
-  // Banco em versão anterior (sem o nº da OS): repete sem a coluna
-  let eaRes = ea;
-  if (eaRes.error && /os_number/.test(eaRes.error.message || '')) {
-    eaRes = await supabase.from('service_authorization').select(`
-      id, number, date, vehicle_id, supplier_id, service_kind,
-      description, estimated_value, responsible_name,
-      vehicle_plate_snapshot, vehicle_model_snapshot, supplier_trade_name_snapshot
-    `).eq('status', 'emitida').is('deleted_at', null).order('date', { ascending: false });
-  }
+  // Banco sem o termo (Parte 3): repete sem as colunas; depois, banco sem a OS (Parte 1)
+  let hasTermCols = true, hasOS = true;
+  if (m.error && isMissingColumn(m.error)) { hasTermCols = false; m = await manQuery('', 'number, os_number'); }
+  if (m.error && isMissingColumn(m.error)) { hasOS = false; m = await manQuery('', 'number'); }
+  if (ea.error && isMissingColumn(ea.error)) { hasOS = false; ea = await eaQuery(''); }
+  _hasTerms = hasTermCols && hasOS && t.available;
+  _termById = new Map();
+  t.byOrder.forEach(list => list.forEach(x => _termById.set(x.id, x)));
+  _invoices = inv;
   if (m.error) { toast('Falha ao carregar manutenções: ' + m.error.message, 'error'); _items = []; }
   else _items = m.data || [];
   _vehicles = v.data || [];
   _suppliers = s.data || [];
   _depts = d.data || [];
-  _emittedAuths = eaRes.data || [];
+  _emittedAuths = ea.data || [];
+  const lbl = document.getElementById('btn-import-label');
+  if (lbl) lbl.textContent = _hasTerms ? 'Gerar termo da OS' : 'Importar autorização';
 }
+
+async function reload() { await loadAll(); renderStats(); renderTable(); }
 
 /** Rótulo da autorização: nº da OS quando houver, senão o código AAAAMMDD-MAN-NNN. */
 const authLabel = (a) => (a?.os_number ? `OS ${a.os_number}` : (a?.number || ''));
+/** Termo ativo da manutenção (só a criada pelo termo tem service_term_id). */
+const termOf = (a) => (a?.service_term_id && _termById.get(a.service_term_id)) || null;
+const activeTermOf = (a) => { const t = termOf(a); return t && t.status === 'emitido' ? t : null; };
+const isManual = (a) => !a.authorization_id;
 
 function fillFilterSelects() {
   document.getElementById('ff-veh').innerHTML = '<option value="">Todos veículos</option>' +
@@ -152,9 +193,8 @@ function fillFilterSelects() {
     _depts.map(d => `<option value="${d.id}">${esc(d.acronym)} — ${esc(d.name)}</option>`).join('');
   document.getElementById('ff-sup').innerHTML = '<option value="">Todas mecânicas</option>' +
     _suppliers.map(s => `<option value="${s.id}">${esc(supplierOptionLabel(s))}</option>`).join('');
-  ['vehicle', 'dept', 'supplier', 'kind', 'status'].forEach(key => {
-    const id = { vehicle: 'ff-veh', dept: 'ff-dept', supplier: 'ff-sup', kind: 'ff-kind', status: 'ff-status' }[key];
-    if (_filter[key]) document.getElementById(id).value = _filter[key];
+  Object.entries(FILTER_IDS).forEach(([id, key]) => {
+    if (key !== 'month' && _filter[key]) document.getElementById(id).value = _filter[key];
   });
   updateClear();
 }
@@ -166,6 +206,8 @@ function applyFilters() {
     if (_filter.supplier && a.supplier_id !== _filter.supplier) return false;
     if (_filter.kind && a.kind !== _filter.kind) return false;
     if (_filter.status && a.status !== _filter.status) return false;
+    if (_filter.origin === 'os' && isManual(a)) return false;
+    if (_filter.origin === 'manual' && !isManual(a)) return false;
     if (_filter.month && String(a.open_date).slice(0, 7) !== _filter.month) return false;
     if (_filter.dept) {
       const veh = _vehicles.find(x => x.id === a.vehicle_id);
@@ -174,11 +216,17 @@ function applyFilters() {
     if (!t) return true;
     const veh = _vehicles.find(x => x.id === a.vehicle_id);
     const sup = _suppliers.find(x => x.id === a.supplier_id);
+    const term = termOf(a);
     return (veh?.plate || '').toLowerCase().includes(t)
         || (veh?.model || '').toLowerCase().includes(t)
         || (sup?.trade_name || sup?.legal_name || '').toLowerCase().includes(t)
         || (a.responsible_name || '').toLowerCase().includes(t)
-        || (a.description || '').toLowerCase().includes(t);
+        || (a.description || '').toLowerCase().includes(t)
+        || (a.manual_reason || '').toLowerCase().includes(t)
+        || (a.authorization?.os_number || '').toLowerCase().includes(t)
+        || (a.authorization?.number || '').toLowerCase().includes(t)
+        || (term?.number || '').toLowerCase().includes(t)
+        || (!!term && (_invoices.get(term.id) || []).some(i => nfMatches(i.invoice_number, _filter.search)));
   });
 }
 
@@ -187,14 +235,20 @@ function renderStats() {
   const totalVal = filtered.reduce((s, a) => s + Number(a.total_value || 0), 0);
   const aberta = filtered.filter(x => x.status === 'aberta').length;
   const concluida = filtered.filter(x => x.status === 'concluida').length;
+  const comTermo = filtered.filter(x => activeTermOf(x)).length;
   document.getElementById('man-stats').innerHTML = `
     <div class="stat-row" style="margin-bottom:var(--s-4)">
       <div class="stat"><label>Registros</label><strong>${filtered.length}</strong></div>
       <div class="stat"><label>Abertas</label><strong style="color:var(--warning)">${aberta}</strong></div>
       <div class="stat"><label>Concluídas</label><strong style="color:var(--success)">${concluida}</strong></div>
+      ${_hasTerms ? `<div class="stat"><label>Com termo</label><strong>${comTermo}</strong></div>` : ''}
       <div class="stat"><label>Valor total</label><strong style="color:var(--success)">${fmtMoney(totalVal)}</strong></div>
     </div>
   `;
+}
+
+function anyFilter() {
+  return _filter.search || _filter.vehicle || _filter.dept || _filter.supplier || _filter.kind || _filter.status || _filter.origin || _filter.month;
 }
 
 function renderTable() {
@@ -206,14 +260,13 @@ function renderTable() {
       <div class="empty-state">
         <div class="empty-state-icon">${icons.wrench}</div>
         <div class="empty-state-title">Nenhuma manutenção</div>
-        <p class="empty-state-text">Importe de uma autorização ou registre manualmente.</p>
+        <p class="empty-state-text">${_hasTerms ? 'Gere o termo de uma ordem de serviço ou registre manualmente.' : 'Importe de uma autorização ou registre manualmente.'}</p>
       </div>`;
     return;
   }
   const filtered = applyFilters();
   if (countEl) {
-    const any = _filter.search || _filter.vehicle || _filter.dept || _filter.supplier || _filter.kind || _filter.status || _filter.month;
-    countEl.textContent = any ? `${filtered.length} de ${_items.length} registro(s)` : `${_items.length} registro(s)`;
+    countEl.textContent = anyFilter() ? `${filtered.length} de ${_items.length} registro(s)` : `${_items.length} registro(s)`;
   }
   if (!filtered.length) {
     box.innerHTML = `
@@ -236,6 +289,7 @@ function renderTable() {
             <th>Valor</th>
             <th>Status</th>
             <th>Origem</th>
+            ${_hasTerms ? '<th>Termo</th>' : ''}
             <th class="actions-col">Ações</th>
           </tr>
         </thead>
@@ -245,14 +299,40 @@ function renderTable() {
   `;
   box.querySelectorAll('[data-act="edit"]').forEach(b => b.addEventListener('click', () => openManModal(b.dataset.id)));
   box.querySelectorAll('[data-act="delete"]').forEach(b => b.addEventListener('click', () => deleteMan(b.dataset.id)));
+  box.querySelectorAll('[data-act="term-pdf"]').forEach(b => b.addEventListener('click', async () => {
+    b.disabled = true;
+    try { await printServiceReceiptTerm(b.dataset.term); } finally { b.disabled = false; }
+  }));
+}
+
+function originCell(a) {
+  const au = a.authorization;
+  if (au?.os_number) return `<div class="cell-stack"><span class="badge of-mono" style="font-size:10.5px">OS ${esc(au.os_number)}</span><span class="of-sub">${esc(au.number || '')}</span></div>`;
+  if (au?.number) return `<span class="badge of-mono" style="font-size:10.5px">${esc(au.number)}</span>`;
+  const reason = a.manual_reason || '';
+  return `<div class="cell-stack">
+    <span class="badge badge-neutral" title="${esc(reason)}">Manual</span>
+    ${reason ? `<span class="of-sub" style="white-space:normal;max-width:220px">${esc(reason)}</span>` : ''}
+  </div>`;
+}
+
+function termCell(a) {
+  const term = termOf(a);
+  if (!term) return '<span class="of-sub">—</span>';
+  const notes = (_invoices.get(term.id) || []).map(i => i.invoice_number).filter(Boolean);
+  const canceled = term.status !== 'emitido';
+  return `<div class="cell-stack">
+    <span class="of-nowrap"><strong class="of-mono">${esc(term.number)}</strong> · ${esc(fmtDate(term.issue_date))}${canceled ? ' <span class="badge badge-danger">Cancelado</span>' : ''}</span>
+    ${notes.length ? `<span class="of-sub">NF ${esc(notes.join(', '))}</span>` : ''}
+    <span class="of-sub of-amount">${fmtMoney(term.total_amount)}</span>
+  </div>`;
 }
 
 function manRow(a) {
   const veh = _vehicles.find(x => x.id === a.vehicle_id);
   const sup = _suppliers.find(x => x.id === a.supplier_id);
-  const origin = a.authorization?.number
-    ? `<span class="badge" style="font-family:ui-monospace,monospace;font-size:10.5px">${esc(a.authorization.number)}</span>`
-    : `<span class="badge badge-neutral">manual</span>`;
+  const term = activeTermOf(a);
+  const lockMsg = term ? `Esta manutenção tem Termo de Recebimento nº ${term.number}. Para alterar, cancele o termo na lista de Ordens de Serviço.` : '';
   return `
     <tr>
       <td data-label="Abertura" style="white-space:nowrap">
@@ -272,27 +352,33 @@ function manRow(a) {
       <td data-label="Mecânica">${supplierCellHTML(a.supplier_trade_name_snapshot || sup?.trade_name || sup?.legal_name, sup)}</td>
       <td data-label="Valor" style="white-space:nowrap;color:var(--success);font-weight:500">${a.total_value != null ? fmtMoney(a.total_value) : '—'}</td>
       <td data-label="Status"><span class="${STATUS_BADGE[a.status]}">${esc(STATUS_LABEL[a.status])}</span></td>
-      <td data-label="Origem">${origin}</td>
+      <td data-label="Origem">${originCell(a)}</td>
+      ${_hasTerms ? `<td data-label="Termo">${termCell(a)}</td>` : ''}
       <td class="actions-col">
         <div class="actions-row">
-          <button class="btn btn-ghost btn-icon btn-sm" data-act="edit" data-id="${a.id}" title="Editar">${icons.edit}</button>
-          ${isAdmin() ? `<button class="btn btn-ghost btn-icon btn-sm" data-act="delete" data-id="${a.id}" title="Excluir" style="color:var(--danger)">${icons.trash}</button>` : ''}
+          ${term ? `<button class="btn btn-ghost btn-icon btn-sm" data-act="term-pdf" data-term="${term.id}" title="Abrir o Termo de Recebimento em PDF">${icons.fileCheck}</button>` : ''}
+          <button class="btn btn-ghost btn-icon btn-sm" data-act="edit" data-id="${a.id}" title="${term ? esc(lockMsg) : 'Editar'}" ${term ? 'disabled' : ''}>${icons.edit}</button>
+          ${isAdmin() ? `<button class="btn btn-ghost btn-icon btn-sm" data-act="delete" data-id="${a.id}" title="${term ? esc(lockMsg) : 'Excluir'}" ${term ? 'disabled' : ''} style="color:var(--danger)">${icons.trash}</button>` : ''}
         </div>
       </td>
     </tr>`;
 }
 
 // =============================================================================
-// IMPORTAR DE AUTORIZAÇÃO
+// GERAR TERMO DA OS / IMPORTAR AUTORIZAÇÃO
+// OS numerada (com o termo no banco) → modal do termo; autorização antiga →
+// registro de manutenção de sempre.
 // =============================================================================
 function openImportModal() {
   if (!_emittedAuths.length) {
-    toast('Nenhuma autorização de manutenção emitida disponível.', 'info');
+    toast(_hasTerms ? 'Nenhuma ordem de serviço emitida aguardando termo.' : 'Nenhuma autorização de manutenção emitida disponível.', 'info');
     return;
   }
   const body = `
     <p style="font-size:13px;color:var(--text-soft);margin-bottom:var(--s-4)">
-      Selecione uma autorização emitida.
+      ${_hasTerms
+        ? 'Selecione a ordem de serviço emitida. Ordens numeradas geram o Termo de Recebimento de Serviço; autorizações antigas (sem nº de OS) são concluídas pelo registro de manutenção.'
+        : 'Selecione uma autorização emitida.'}
     </p>
     <div class="table-toolbar" style="margin-bottom:var(--s-3)">
       <div class="search has-value" style="max-width:none">
@@ -303,7 +389,7 @@ function openImportModal() {
     <div id="imp-list" style="max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--r-md)"></div>
   `;
   const footer = `<button class="btn btn-outline" data-cancel>Cancelar</button>`;
-  const m = openModal({ title: 'Importar de autorização', body, footer, size: 'lg' });
+  const m = openModal({ title: _hasTerms ? 'Gerar termo da ordem de serviço' : 'Importar de autorização', body, footer, size: 'lg' });
   m.querySelector('[data-cancel]').addEventListener('click', closeModal);
 
   const listEl = m.querySelector('#imp-list');
@@ -315,7 +401,7 @@ function openImportModal() {
       (a.vehicle_plate_snapshot || '').toLowerCase().includes(t) ||
       (a.supplier_trade_name_snapshot || '').toLowerCase().includes(t));
     if (!filtered.length) {
-      listEl.innerHTML = `<div style="padding:var(--s-5);text-align:center;color:var(--text-muted);font-size:13px">Nenhuma autorização encontrada.</div>`;
+      listEl.innerHTML = `<div style="padding:var(--s-5);text-align:center;color:var(--text-muted);font-size:13px">Nenhuma ordem encontrada.</div>`;
       return;
     }
     listEl.innerHTML = filtered.map(a => `
@@ -331,6 +417,7 @@ function openImportModal() {
             ${esc(fmtDate(a.date))} · ${esc(a.supplier_trade_name_snapshot)} · ${esc(a.responsible_name)}
           </div>
           <div style="font-size:11px;color:var(--text-muted);margin-top:4px;font-style:italic">${esc(a.description)}</div>
+          ${_hasTerms && !a.os_number ? `<div style="font-size:11px;color:var(--warning);margin-top:4px">Autorização antiga, sem nº de OS: conclui pelo registro de manutenção.</div>` : ''}
         </div>
         <span style="color:var(--primary)">${icons.chevronRight}</span>
       </button>
@@ -341,7 +428,8 @@ function openImportModal() {
       btn.addEventListener('click', () => {
         closeModal();
         const a = _emittedAuths.find(x => x.id === btn.dataset.id);
-        openManModal(null, a);
+        if (_hasTerms && a.os_number) openServiceTermModal(a, reload);
+        else openManModal(null, a);
       });
     });
   };
@@ -350,17 +438,21 @@ function openImportModal() {
 }
 
 // =============================================================================
-// MODAL NOVO/EDITAR
+// MODAL NOVO/EDITAR (registro manual ou conclusão de autorização antiga)
 // =============================================================================
 function openManModal(id, fromAuth = null) {
   const editing = !!id;
   const a = editing ? _items.find(x => x.id === id) : null;
+  if (a && activeTermOf(a)) {
+    toast(`Esta manutenção tem Termo de Recebimento nº ${activeTermOf(a).number}. Para alterar, cancele o termo na lista de Ordens de Serviço.`, 'warning', 7000);
+    return;
+  }
   const me = getProfile();
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localToday();
 
   let initial;
   if (editing) {
-    initial = { ...a, _authNumber: a.authorization?.number };
+    initial = { ...a, _authNumber: authLabel(a.authorization) };
   } else if (fromAuth) {
     const veh = _vehicles.find(v => v.id === fromAuth.vehicle_id);
     initial = {
@@ -385,23 +477,24 @@ function openManModal(id, fromAuth = null) {
       kind: 'corretiva', description: '', total_value: '',
       responsible_name: me?.full_name || '',
       open_date: today, close_date: null,
-      km_at_service: null,
+      km_at_service: null, manual_reason: '',
       notes: '', status: 'concluida', _authNumber: null,
     };
   }
 
   const isLinked = !!initial.authorization_id;
+  // Justificativa: obrigatória no registro sem OS quando o banco já tem a coluna
+  const needReason = _hasTerms && !isLinked;
   const vehOptions = '<option value="">— Selecione —</option>' +
     _vehicles.map(v => `<option value="${v.id}" ${initial.vehicle_id === v.id ? 'selected' : ''}>${esc(formatPlate(v.plate))} — ${esc(v.model)} (${esc(v.department?.acronym || '—')})</option>`).join('');
   // Fornecedor: linked → mostra só o item fixo; senão → placeholder que
   // vai ser preenchido pelo listener do veículo.
-  const initSupOption = isLinked
+  const supOptions = isLinked
     ? (() => {
         const s = _suppliers.find(x => x.id === initial.supplier_id);
         return s ? `<option value="${s.id}" selected>${esc(supplierOptionLabel(s))}</option>` : '';
       })()
     : '<option value="">— Selecione o veículo primeiro —</option>';
-  const supOptions = initSupOption;
   const kindOptions = Object.entries(KIND_LABEL).map(([k, l]) =>
     `<option value="${k}" ${initial.kind === k ? 'selected' : ''}>${esc(l)}</option>`).join('');
   const statusOptions = Object.entries(STATUS_LABEL).map(([k, l]) =>
@@ -412,7 +505,10 @@ function openManModal(id, fromAuth = null) {
       ${isLinked ? `
         <div class="alert" style="background:var(--primary-tint);border-left:3px solid var(--primary);padding:var(--s-3) var(--s-4);border-radius:var(--r-md);margin-bottom:var(--s-4);font-size:13px">
           <strong>Vinculado à autorização</strong>${initial._authNumber ? ` <span style="font-family:ui-monospace,monospace;color:var(--primary)">${esc(initial._authNumber)}</span>` : ''}
-        </div>` : ''}
+        </div>` : (needReason ? `
+        <div class="alert" style="background:var(--warning-bg);border-left:3px solid var(--warning);padding:var(--s-3) var(--s-4);border-radius:var(--r-md);margin-bottom:var(--s-4);font-size:13px">
+          <strong>Registro sem ordem de serviço.</strong> Não gera termo de recebimento. Informe a justificativa.
+        </div>` : '')}
       <div class="form-grid">
         <div class="field">
           <label class="field-label">Data abertura <span class="req">*</span></label>
@@ -456,6 +552,12 @@ function openManModal(id, fromAuth = null) {
           <label class="field-label">Descrição do serviço <span class="req">*</span></label>
           <textarea class="textarea" name="description" rows="3" required minlength="3">${esc(initial.description || '')}</textarea>
         </div>
+        ${needReason ? `
+        <div class="field col-full">
+          <label class="field-label">Justificativa do registro manual <span class="req">*</span></label>
+          <textarea class="textarea" name="manual_reason" rows="2" required minlength="${MIN_REASON}" placeholder="Por que este serviço não teve ordem de serviço?">${esc(initial.manual_reason || '')}</textarea>
+          <div class="field-help">Mostrada na lista e no Excel. Mínimo de ${MIN_REASON} caracteres.</div>
+        </div>` : ''}
         <div class="field col-full">
           <label class="field-label">Observações</label>
           <textarea class="textarea" name="notes" rows="2">${esc(initial.notes || '')}</textarea>
@@ -498,10 +600,10 @@ function openManModal(id, fromAuth = null) {
   rebuildSupplierOptions(initial.supplier_id || '');
 
   m.querySelector('[data-cancel]').addEventListener('click', closeModal);
-  m.querySelector('#man-save-btn').addEventListener('click', () => saveMan(id, initial));
+  m.querySelector('#man-save-btn').addEventListener('click', () => saveMan(id, initial, needReason));
 }
 
-async function saveMan(id, initial) {
+async function saveMan(id, initial, needReason) {
   const form = document.getElementById('man-form');
   const errBox = document.getElementById('man-errors');
   errBox.style.display = 'none';
@@ -511,6 +613,10 @@ async function saveMan(id, initial) {
   const supplier_id = v.supplier_id || v.supplier_id_h || initial.supplier_id;
   if (!vehicle_id || !supplier_id) {
     errBox.innerHTML = '⚠️ Selecione veículo e mecânica.'; errBox.style.display = 'block'; return;
+  }
+  const reason = (v.manual_reason || '').trim();
+  if (needReason && reason.length < MIN_REASON) {
+    errBox.innerHTML = `⚠️ Informe a justificativa do registro manual (mínimo de ${MIN_REASON} caracteres).`; errBox.style.display = 'block'; return;
   }
   const payload = {
     authorization_id: initial?.authorization_id || null,
@@ -525,6 +631,7 @@ async function saveMan(id, initial) {
     responsible_name: v.responsible_name,
     notes: v.notes || null,
   };
+  if (needReason) payload.manual_reason = reason;
   const btn = document.getElementById('man-save-btn');
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Salvando...';
   try {
@@ -534,9 +641,9 @@ async function saveMan(id, initial) {
     if (error) throw error;
     toast(id ? 'Manutenção atualizada.' : 'Manutenção registrada.', 'success');
     closeModal();
-    await loadAll(); renderStats(); renderTable();
+    await reload();
   } catch (err) {
-    errBox.innerHTML = '⚠️ ' + (err.message || 'Erro ao salvar.');
+    errBox.innerHTML = '⚠️ ' + billingError(err);
     errBox.style.display = 'block';
     btn.disabled = false; btn.textContent = id ? 'Salvar alterações' : 'Registrar manutenção';
   }
@@ -545,15 +652,61 @@ async function saveMan(id, initial) {
 async function deleteMan(id) {
   const a = _items.find(x => x.id === id);
   if (!a) return;
-  const linked = a.authorization?.number ? ` (vinculado à autorização ${a.authorization.number})` : '';
+  const term = activeTermOf(a);
+  if (term) {
+    toast(`Esta manutenção tem Termo de Recebimento nº ${term.number}. Para alterar, cancele o termo na lista de Ordens de Serviço.`, 'warning', 7000);
+    return;
+  }
+  const linked = a.authorization ? ` (vinculada à ${a.authorization.os_number ? 'OS nº ' + a.authorization.os_number : 'autorização ' + a.authorization.number})` : '';
   const ok = await confirmDialog({
     title: 'Excluir manutenção',
-    message: `Excluir esta manutenção${linked}? Se for a única do vínculo, a autorização volta para "Emitida".`,
+    message: `Excluir esta manutenção${linked}? Se for a única do vínculo, a ordem volta para "Emitida".`,
     confirmText: 'Excluir', danger: true,
   });
   if (!ok) return;
   const { error } = await supabase.from('maintenance').delete().eq('id', id);
-  if (error) { toast(error.message, 'error'); return; }
+  if (error) { toast(billingError(error), 'error'); return; }
   toast('Manutenção excluída.', 'success');
-  await loadAll(); renderStats(); renderTable();
+  await reload();
+}
+
+// =============================================================================
+// EXCEL (respeita os filtros)
+// =============================================================================
+function exportExcel() {
+  const list = applyFilters();
+  if (!list.length) { toast('Nenhuma manutenção para exportar com os filtros atuais.', 'warning'); return; }
+  const columns = [
+    'Abertura', 'Conclusão', 'Placa', 'Modelo', 'Secretaria', 'Categoria', 'Status', 'Serviço',
+    'Mecânica', 'CNPJ', 'Valor (R$)', 'KM', 'Responsável', 'Origem', 'Nº da OS', 'Código da autorização',
+    'Justificativa (manual)', 'Termo nº', 'Data do termo', 'Notas fiscais', 'Valor das notas (R$)', 'Fiscal do contrato', 'Observações',
+  ];
+  const rows = list.map(a => {
+    const veh = _vehicles.find(x => x.id === a.vehicle_id);
+    const sup = _suppliers.find(x => x.id === a.supplier_id);
+    const term = termOf(a);
+    const inv = term ? (_invoices.get(term.id) || []) : [];
+    return [
+      a.open_date || '', a.close_date || '',
+      formatPlate(veh?.plate || ''), veh?.model || '', veh?.department?.acronym || '',
+      KIND_LABEL[a.kind] || a.kind, STATUS_LABEL[a.status] || a.status, a.description || '',
+      sup?.trade_name || sup?.legal_name || '', sup?.cnpj || '',
+      a.total_value != null ? Number(a.total_value) : '', a.km_at_service != null ? Number(a.km_at_service) : '',
+      a.responsible_name || '',
+      isManual(a) ? 'Manual' : (a.authorization?.os_number ? 'Ordem de serviço' : 'Autorização'),
+      a.authorization?.os_number || '', a.authorization?.number || '',
+      a.manual_reason || '',
+      term ? term.number + (term.status !== 'emitido' ? ' (cancelado)' : '') : '', term?.issue_date || '',
+      inv.map(i => `${i.invoice_number}${i.supplier_name ? ' (' + i.supplier_name + ')' : ''}`).join('; '),
+      term ? Number(term.total_amount || 0) : '',
+      term?.fiscal_name || '',
+      a.notes || '',
+    ];
+  });
+  try {
+    exportXLSX({ filename: timestampFilename('manutencoes'), sheetName: 'Manutenções', columns, rows });
+    toast(`${rows.length} manutenção(ões) exportada(s).`, 'success');
+  } catch (e) {
+    toast('Falha ao exportar: ' + (e.message || e), 'error');
+  }
 }
