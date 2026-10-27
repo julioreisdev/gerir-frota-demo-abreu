@@ -379,7 +379,9 @@ Pedido do cliente de 27/10/2026 (`Pedido Cliente 27 de Out 26/`, fora do git). P
 - **Km de entrada**: bloqueia menor que `vehicle.current_km` quando este é > 0; a emissão grava `greatest(current_km, km_in)` no veículo. Tipo 99 usa 99999999.
 - **Assinaturas**: `app_user.job_title` (cargo) sai na OS com `full_name` de quem emitiu. Nos documentos do combustível, o responsável da secretaria passa por `_responsible_or_issuer` (gatilho na inserção de `supply_order` e `receipt_term`): vazio ou igual a um login vira o nome completo de quem emitiu. O campo "Responsável" da secretaria recusa um login (gatilho `department_responsible_check`).
 - **Fiscal do contrato vale para mecânica** (Fornecedores e Configuração mostram para todos os tipos). Perfil `fornecedor` não tem mais Dashboard.
-- Partes entregues: **1 (base)**. Faltam: 2 (tela e PDF da OS), 3 (termo: banco), 4 (termo: telas e PDF), 5 (layout portátil).
+- **Tela**: aba "Ordens de Serviço" em [js/pages/autorizacoes_service.js](js/pages/autorizacoes_service.js). Modal novo (`openOrderModal`) só quando o banco tem as colunas e a ordem é numerada; autorização antiga ou banco antigo abrem o modal de sempre (`openLegacyModal`). PDF A4 da OS em [js/service_docs.js](js/service_docs.js) (modelo do cliente, CSS de `billing_docs.js`); autorização antiga mantém o A4 anterior. Térmica e QR mostram nº da OS, serviços e peças.
+- Até o termo existir (Parte 3/4), a OS numerada ainda é concluída pelo registro de manutenção de sempre ("Concluir").
+- Partes entregues: **1 (base)**, **2 (tela e PDF da OS)**. Faltam: 3 (termo: banco), 4 (termo: telas e PDF), 5 (layout portátil).
 
 ### Tolerância a banco desatualizado
 

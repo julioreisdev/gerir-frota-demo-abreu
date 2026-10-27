@@ -8,7 +8,8 @@ import { openPrintTab } from './thermal.js';
 import { fmtLiters, fmtAmount, fmtPrice, fmtInt, toCenti, fmtCents, billingError, fmtOrdinance } from './billing.js';
 
 // Estilo comum aos documentos (modelos/_estilo.css do pacote do cliente).
-const DOC_CSS = `
+// Reaproveitado pela Ordem de Serviço e pelo Termo de Serviço (service_docs.js).
+export const DOC_CSS = `
 @page { size: A4; margin: 16mm 14mm 18mm 14mm;
   @bottom-left { content: "Gerir Frota"; font: 8pt Arial, sans-serif; color: #5A6676; }
   @bottom-right { content: "Página " counter(page) " de " counter(pages); font: 8pt Arial, sans-serif; color: #5A6676; } }

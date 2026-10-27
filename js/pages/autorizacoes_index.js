@@ -40,15 +40,15 @@ export async function renderAutorizacoes() {
     ${pageHeader({
       title: 'Autorizações',
       subtitle: _availableTabs.length > 1
-        ? 'Gerencie autorizações de abastecimento e de manutenção.'
+        ? 'Gerencie autorizações de abastecimento e ordens de serviço de manutenção.'
         : (_availableTabs[0] === 'fueling'
             ? 'Autorizações de abastecimento vinculadas a você.'
-            : 'Autorizações de manutenção vinculadas a você.'),
+            : 'Ordens de serviço emitidas para você.'),
     })}
     ${_availableTabs.length > 1 ? `
     <div class="tab-bar" id="aut-tabs" role="tablist">
       ${tabHTML('fueling', icons.droplet, 'Abastecimento')}
-      ${tabHTML('service', icons.wrench, 'Manutenção')}
+      ${tabHTML('service', icons.wrench, 'Ordens de Serviço')}
     </div>` : ''}
     <div id="aut-tab-content"></div>
   `;

@@ -120,18 +120,30 @@ async function loadAll() {
     `).in('kind', ['mecanica', 'ambos']).order('legal_name'),
     supabase.from('department').select('id, acronym, name').order('acronym'),
     supabase.from('service_authorization').select(`
-      id, number, date, vehicle_id, supplier_id, service_kind,
+      id, number, os_number, date, vehicle_id, supplier_id, service_kind,
       description, estimated_value, responsible_name,
       vehicle_plate_snapshot, vehicle_model_snapshot, supplier_trade_name_snapshot
     `).eq('status', 'emitida').is('deleted_at', null).order('date', { ascending: false }),
   ]);
+  // Banco em versão anterior (sem o nº da OS): repete sem a coluna
+  let eaRes = ea;
+  if (eaRes.error && /os_number/.test(eaRes.error.message || '')) {
+    eaRes = await supabase.from('service_authorization').select(`
+      id, number, date, vehicle_id, supplier_id, service_kind,
+      description, estimated_value, responsible_name,
+      vehicle_plate_snapshot, vehicle_model_snapshot, supplier_trade_name_snapshot
+    `).eq('status', 'emitida').is('deleted_at', null).order('date', { ascending: false });
+  }
   if (m.error) { toast('Falha ao carregar manutenções: ' + m.error.message, 'error'); _items = []; }
   else _items = m.data || [];
   _vehicles = v.data || [];
   _suppliers = s.data || [];
   _depts = d.data || [];
-  _emittedAuths = ea.data || [];
+  _emittedAuths = eaRes.data || [];
 }
+
+/** Rótulo da autorização: nº da OS quando houver, senão o código AAAAMMDD-MAN-NNN. */
+const authLabel = (a) => (a?.os_number ? `OS ${a.os_number}` : (a?.number || ''));
 
 function fillFilterSelects() {
   document.getElementById('ff-veh').innerHTML = '<option value="">Todos veículos</option>' +
@@ -299,6 +311,7 @@ function openImportModal() {
     const t = term.toLowerCase();
     const filtered = _emittedAuths.filter(a => !t ||
       (a.number || '').toLowerCase().includes(t) ||
+      (a.os_number || '').toLowerCase().includes(t) ||
       (a.vehicle_plate_snapshot || '').toLowerCase().includes(t) ||
       (a.supplier_trade_name_snapshot || '').toLowerCase().includes(t));
     if (!filtered.length) {
@@ -308,7 +321,7 @@ function openImportModal() {
     listEl.innerHTML = filtered.map(a => `
       <button type="button" class="imp-row" data-id="${a.id}" style="display:flex;justify-content:space-between;align-items:center;width:100%;padding:var(--s-3) var(--s-4);border-bottom:1px solid var(--border);background:var(--surface);text-align:left">
         <div>
-          <div style="font-family:ui-monospace,monospace;font-weight:700;color:var(--primary);font-size:13px">${esc(a.number)}</div>
+          <div style="font-family:ui-monospace,monospace;font-weight:700;color:var(--primary);font-size:13px">${esc(authLabel(a))}${a.os_number ? ` <span style="font-weight:400;color:var(--text-muted);font-size:11px">${esc(a.number)}</span>` : ''}</div>
           <div style="font-size:12px;color:var(--text-soft);margin-top:2px">
             ${esc(formatPlate(a.vehicle_plate_snapshot))} — ${esc(a.vehicle_model_snapshot)} ·
             ${esc(KIND_LABEL[a.service_kind] || a.service_kind)} ·
@@ -361,9 +374,9 @@ function openManModal(id, fromAuth = null) {
       open_date: fromAuth.date || today,    // data da autorização (editável)
       close_date: fromAuth.date || today,
       km_at_service: veh?.current_km || null,
-      notes: 'Importado da autorização ' + fromAuth.number,
+      notes: (fromAuth.os_number ? 'Importado da ordem de serviço ' : 'Importado da autorização ') + authLabel(fromAuth).replace(/^OS /, 'nº '),
       status: 'concluida',
-      _authNumber: fromAuth.number,
+      _authNumber: authLabel(fromAuth),
     };
   } else {
     initial = {
