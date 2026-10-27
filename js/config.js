@@ -1,6 +1,6 @@
 // Configuração da instância — única coisa que muda de cidade pra cidade.
-// Instância: DEMO (demo.gerirfrota.com) — demonstração, entidade Prefeitura Municipal de Anísio de Abreu.
-export const SUPABASE_URL = 'https://vpwdaidpyeoqviyldgth.supabase.co';
-export const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_WuI5milaRAW2SwCaJAehcA_T7uTDgDd';
+// Instância: JUREMA (jurema.gerirfrota.com) — Prefeitura Municipal de Jurema.
+export const SUPABASE_URL = 'https://mzqqetjpqqbotubzabsn.supabase.co';
+export const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_32zOSDZK27QZq4j38G4X8A_y-limrmo';
 export const APP_NAME = 'Gerir Frota';
 export const APP_FAVICON = 'logo.png';
