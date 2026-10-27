@@ -9,8 +9,9 @@ import { canInstall, install, onInstallStateChange } from './pwa.js';
 
 const APP_ICON = 'assets/icons/icon-192.png';
 
-/** Tablet e celular (≤ 900px): sem sidebar; barra inferior e página Início. */
-export const isMobile = () => window.matchMedia('(max-width: 900px)').matches;
+/** Tablet e celular (≤ 1024px): sem sidebar; abas fixas no rodapé e página Início. */
+export const MOBILE_MAX = 1024;
+export const isMobile = () => window.matchMedia(`(max-width: ${MOBILE_MAX}px)`).matches;
 
 // Catálogo de páginas — único lugar onde definir nav + permissões + breadcrumb
 export const NAV = [
@@ -32,25 +33,50 @@ export const NAV = [
   { path: '/exportacao',     label: 'Exportação TCE',   icon: 'download',   roles: ['admin','usuario'] },
 ];
 
-// Barra inferior (tablet e celular), por perfil. "Mais" entra sempre no fim.
-const MOBILE_BAR = {
-  admin:       ['/inicio', '/autorizacoes', '/abastecimentos', '/relatorios'],
-  usuario:     ['/inicio', '/autorizacoes', '/abastecimentos', '/relatorios'],
-  fornecedor:  ['/inicio', '/autorizacoes', '/faturamento'],
-  faturamento: ['/inicio', '/faturamento'],
-};
-const HOME_ITEM = { path: '/inicio', label: 'Início', icon: 'home' };
-// Rótulos curtos para caber em cinco posições num celular estreito
-const BAR_LABEL = { '/autorizacoes': 'Autorizar', '/abastecimentos': 'Abastecer' };
-const ROLE_LABEL = { admin: 'Administrador', usuario: 'Usuário', fornecedor: 'Fornecedor', faturamento: 'Faturamento' };
+// Abas fixas do aplicativo (tablet e celular), iguais para todos os perfis.
+// Cada aba é uma página de blocos; a aba só aparece se tiver algum bloco para o perfil.
+export const TABS = [
+  { path: '/inicio',    label: 'Início',    icon: 'home' },
+  { path: '/cadastros', label: 'Cadastros', icon: 'folder' },
+  { path: '/analise',   label: 'Análise',   icon: 'barChart' },
+  { path: '/perfil',    label: 'Perfil',    icon: 'user' },
+];
+export const ROLE_LABEL = { admin: 'Administrador', usuario: 'Usuário', fornecedor: 'Fornecedor', faturamento: 'Faturamento' };
+
+/** Itens de um grupo do menu (o Dashboard, fora de grupo, conta como Análise). */
+function groupPages(group) {
+  const out = [];
+  let cur = null;
+  NAV.forEach(i => {
+    if (i.group) { cur = i.group; return; }
+    const g = cur || 'Análise';
+    if (g === group) out.push(i);
+  });
+  return out;
+}
+const TAB_GROUP = { '/inicio': 'Operação', '/cadastros': 'Cadastros', '/analise': 'Análise' };
 
 /** Páginas que o perfil pode abrir (sem o Início). */
 export function pagesForRole(role) {
   return NAV.filter(i => i.path && i.roles.includes(role));
 }
+/** Blocos de uma aba para o perfil (Início → Operação; Análise inclui o Dashboard). */
+export function tabPages(tab, role) {
+  const g = TAB_GROUP[tab];
+  return g ? groupPages(g).filter(i => i.roles.includes(role)) : [];
+}
+/** Aba ativa para uma rota: páginas de Operação ficam no Início. */
+export function activeTab(path) {
+  if (TABS.some(t => t.path === path)) return path;
+  for (const tab of Object.keys(TAB_GROUP)) {
+    if (groupPages(TAB_GROUP[tab]).some(i => i.path === path)) return tab;
+  }
+  return '/inicio';
+}
 /** O perfil pode abrir esta rota? */
 export function canAccess(path, role) {
-  if (path === '/inicio') return true;
+  if (path === '/inicio' || path === '/perfil') return true;
+  if (path === '/cadastros' || path === '/analise') return tabPages(path, role).length > 0;
   return NAV.some(i => i.path === path && i.roles.includes(role));
 }
 /** Rota de entrada: celular → Início; computador → Dashboard (faturamento → Faturamento). */
@@ -62,6 +88,9 @@ export function defaultPath(role) {
 // Breadcrumb por rota
 const BREADCRUMB = {
   '/inicio':         [{ label: 'Início' }],
+  '/cadastros':      [{ label: 'Cadastros' }],
+  '/analise':        [{ label: 'Análise' }],
+  '/perfil':         [{ label: 'Perfil' }],
   '/dashboard':      [{ label: 'Dashboard' }],
   '/entidade':       [{ label: 'Cadastros' }, { label: 'Entidade' }],
   '/usuarios':       [{ label: 'Cadastros' }, { label: 'Usuários' }],
@@ -115,7 +144,7 @@ export function reportLogoUrl(entity) {
   return fallback;
 }
 
-function userInitials(name) {
+export function userInitials(name) {
   if (!name) return '?';
   const parts = name.trim().split(/\s+/);
   return ((parts[0]?.[0] || '') + (parts[parts.length - 1]?.[0] || '')).toUpperCase();
@@ -150,49 +179,14 @@ export async function renderShell() {
   // Em tamanho pequeno entra o símbolo (ícone do app); a logo completa fica no login e nos impressos
   const logoHTML = `<img src="${APP_ICON}" alt="${esc(APP_NAME)}">`;
 
-  // Barra inferior e folha "Mais" (tablet e celular)
-  const barPaths = MOBILE_BAR[allowedRoles] || MOBILE_BAR.usuario;
-  const barItems = barPaths.map(p => (p === '/inicio' ? HOME_ITEM : NAV.find(i => i.path === p))).filter(Boolean);
-  const morePages = pagesForRole(allowedRoles).filter(i => !barPaths.includes(i.path));
+  // Abas fixas (tablet e celular): só as que têm bloco para o perfil
   const bottomNavHTML = `
     <nav class="bottom-nav" id="bottom-nav" aria-label="Navegação">
-      ${barItems.map(i => `
-        <a href="#${i.path}" class="bn-item" data-path="${i.path}">
-          ${iconSpan(i.icon, 'bn-icon')}<span>${esc(BAR_LABEL[i.path] || i.label)}</span>
+      ${TABS.filter(t => canAccess(t.path, allowedRoles)).map(t => `
+        <a href="#${t.path}" class="bn-item" data-tab="${t.path}">
+          ${iconSpan(t.icon, 'bn-icon')}<span>${esc(t.label)}</span>
         </a>`).join('')}
-      <button type="button" class="bn-item" id="bn-more" data-more>
-        ${iconSpan('menu', 'bn-icon')}<span>Mais</span>
-      </button>
     </nav>`;
-  const moreGroups = [];
-  NAV.forEach(i => {
-    if (i.group) { moreGroups.push({ label: i.group, items: [] }); return; }
-    if (!morePages.includes(i)) return;
-    if (!moreGroups.length) moreGroups.push({ label: '', items: [] });
-    moreGroups.at(-1).items.push(i);
-  });
-  const moreSheetHTML = `
-    <div class="more-backdrop" id="more-backdrop"></div>
-    <div class="more-sheet" id="more-sheet" role="dialog" aria-modal="true" aria-label="Mais opções">
-      <div class="more-handle"></div>
-      <div class="more-user">
-        <div class="user-avatar">${esc(userInitials(userName))}</div>
-        <div class="more-user-info">
-          <div class="user-name">${esc(userName)}</div>
-          <div class="user-role">${esc(ROLE_LABEL[userRole] || userRole)}${entity ? ' · ' + esc(entity.organ_name) : ''}</div>
-        </div>
-      </div>
-      ${moreGroups.filter(g => g.items.length).map(g => `
-        ${g.label ? `<div class="more-group">${esc(g.label)}</div>` : ''}
-        ${g.items.map(i => `
-          <a href="#${i.path}" class="more-item" data-path="${i.path}">
-            ${iconSpan(i.icon, 'more-icon')}<span>${esc(i.label)}</span>${icons.chevronRight}
-          </a>`).join('')}`).join('')}
-      <div class="more-actions">
-        <button type="button" class="btn btn-outline" id="more-install" hidden>${icons.download}<span>Instalar aplicativo</span></button>
-        <button type="button" class="btn btn-outline more-logout" id="more-logout">${icons.logout}<span>Sair</span></button>
-      </div>
-    </div>`;
 
   root.innerHTML = `
     <div class="app" id="app-shell">
@@ -240,7 +234,6 @@ export async function renderShell() {
         </main>
         ${bottomNavHTML}
       </div>
-      ${moreSheetHTML}
     </div>
   `;
 
@@ -267,7 +260,7 @@ function setupShellEvents() {
 
   toggle?.addEventListener('click', () => {
     // Mobile: abre/fecha drawer. Desktop: colapsa/expande.
-    if (window.innerWidth <= 900) {
+    if (window.innerWidth <= MOBILE_MAX) {
       shell.classList.toggle('sidebar-open');
     } else {
       shell.classList.toggle('sidebar-collapsed');
@@ -278,61 +271,40 @@ function setupShellEvents() {
 
   // fecha drawer ao navegar no mobile
   document.getElementById('sidebar-nav')?.addEventListener('click', () => {
-    if (window.innerWidth <= 900) shell.classList.remove('sidebar-open');
+    if (window.innerWidth <= MOBILE_MAX) shell.classList.remove('sidebar-open');
   });
 
-  // Folha "Mais" (tablet e celular)
-  const sheet = document.getElementById('more-sheet');
-  const backdrop = document.getElementById('more-backdrop');
-  const moreBtn = document.getElementById('bn-more');
-  const moreInstall = document.getElementById('more-install');
-  const setMore = (open) => {
-    shell.classList.toggle('more-open', open);
-    moreBtn?.setAttribute('aria-expanded', String(open));
-    sheet?.setAttribute('aria-hidden', String(!open));
-  };
-  moreBtn?.addEventListener('click', () => setMore(!shell.classList.contains('more-open')));
-  backdrop?.addEventListener('click', () => setMore(false));
-  sheet?.addEventListener('click', (e) => { if (e.target.closest('a[href]')) setMore(false); });
-  window.addEventListener('hashchange', () => setMore(false));
-  if (moreInstall) {
-    moreInstall.addEventListener('click', () => { setMore(false); install(); });
-    onInstallStateChange((ok) => { moreInstall.hidden = !ok; });
-  }
-  document.getElementById('more-logout')?.addEventListener('click', () => { setMore(false); doLogout(); });
+  logoutBtn?.addEventListener('click', logoutFlow);
+}
 
-  logoutBtn?.addEventListener('click', doLogout);
-  async function doLogout() {
-    const ok = await confirmDialog({
-      title: 'Sair do sistema',
-      message: 'Deseja realmente encerrar sua sessão?',
-      confirmText: 'Sair',
+/** Confirma e encerra a sessão (menu lateral e aba Perfil). */
+export async function logoutFlow() {
+  const ok = await confirmDialog({
+    title: 'Sair do sistema',
+    message: 'Deseja realmente encerrar sua sessão?',
+    confirmText: 'Sair',
+  });
+  if (!ok) return;
+  try { await logout(); } catch (e) { console.warn('logout', e); }
+  // limpeza paranoica de qualquer storage residual do Supabase
+  try {
+    Object.keys(localStorage).forEach(k => {
+      if (k.startsWith('sb-') || k.includes('supabase')) localStorage.removeItem(k);
     });
-    if (!ok) return;
-    try { await logout(); } catch (e) { console.warn('logout', e); }
-    // limpeza paranoica de qualquer storage residual do Supabase
-    try {
-      Object.keys(localStorage).forEach(k => {
-        if (k.startsWith('sb-') || k.includes('supabase')) localStorage.removeItem(k);
-      });
-    } catch {}
-    // remove hash sem disparar router, recarrega limpo → boot vê sessão nula
-    history.replaceState(null, '', window.location.pathname + window.location.search);
-    window.location.reload();
-  }
+  } catch {}
+  // remove hash sem disparar router, recarrega limpo → boot vê sessão nula
+  history.replaceState(null, '', window.location.pathname + window.location.search);
+  window.location.reload();
 }
 
 export function updateActiveNav(path) {
   document.querySelectorAll('#sidebar-nav .nav-item').forEach(el => {
     el.classList.toggle('active', el.dataset.path === path);
   });
-  // Barra inferior: "Mais" fica ativo quando a página aberta está na folha
-  const inBar = [...document.querySelectorAll('#bottom-nav .bn-item[data-path]')].some(el => el.dataset.path === path);
+  // Abas fixas: a página de Operação aberta a partir do Início mantém o Início ativo
+  const tab = activeTab(path);
   document.querySelectorAll('#bottom-nav .bn-item').forEach(el => {
-    el.classList.toggle('active', el.dataset.path ? el.dataset.path === path : (!inBar && path !== '/inicio'));
-  });
-  document.querySelectorAll('#more-sheet .more-item').forEach(el => {
-    el.classList.toggle('active', el.dataset.path === path);
+    el.classList.toggle('active', el.dataset.tab === tab);
   });
 }
 

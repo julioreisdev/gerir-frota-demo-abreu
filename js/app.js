@@ -2,7 +2,7 @@
 import { loadSession, getSession, getProfile, onAuthChange } from './auth.js';
 import { renderLogin } from './pages/login.js';
 import { renderShell, updateActiveNav, updateBreadcrumb, canAccess, defaultPath } from './shell.js';
-import { renderInicio } from './pages/inicio.js';
+import { renderInicio, renderCadastros, renderAnalise, renderPerfil } from './pages/inicio.js';
 import { renderPlaceholder } from './pages/placeholder.js';
 import { renderEntidade } from './pages/entidade.js';
 import { renderUsuarios } from './pages/usuarios.js';
@@ -33,6 +33,9 @@ function guarded(path, render) {
 // Registra rotas. Páginas não-implementadas usam placeholder.
 function registerRoutes() {
   register('/inicio',         renderInicio);
+  register('/cadastros',      guarded('/cadastros', renderCadastros));
+  register('/analise',        guarded('/analise', renderAnalise));
+  register('/perfil',         renderPerfil);
   register('/dashboard',      guarded('/dashboard', renderDashboard));
   register('/entidade',       guarded('/entidade', renderEntidade));
   register('/usuarios',       guarded('/usuarios', renderUsuarios));
