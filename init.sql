@@ -4258,6 +4258,468 @@ revoke all on function delete_service_authorization(uuid) from public;
 grant execute on function delete_service_authorization(uuid) to authenticated;
 
 -- =============================================================================
+-- 23) ORDEM DE SERVIÇO — Parte 3: Termo de Recebimento Definitivo de Serviço
+--   Gerado a partir de uma OS emitida, quando as notas fiscais chegam. O fiscal
+--   lança as notas (a da mecânica e as de peças, cada uma com o fornecedor),
+--   a vistoria, o km de entrega e a garantia. O banco valida e grava:
+--     - total recebido = soma das notas, nunca acima do estimado na OS
+--     - cria a manutenção (status concluída) com o valor real e o km de entrega
+--     - a OS passa a Concluída (utilizada) e fica travada, junto da manutenção
+--     - o km de entrega vira referência do veículo
+--   Cancelar o termo devolve a OS a Emitida e apaga (soft) a manutenção.
+--   A mecânica (perfil fornecedor) não vê o termo.
+-- Idempotente.
+-- =============================================================================
+
+do $$ begin
+  if not exists (select 1 from pg_type where typname = 'service_term_status') then
+    create type service_term_status as enum ('emitido','cancelado');
+  end if;
+end $$;
+
+create table if not exists service_receipt_term (
+  id uuid primary key default gen_random_uuid(),
+  service_authorization_id uuid not null references service_authorization(id),
+  number text not null,                                  -- = os_number
+  issue_date date not null default current_date,         -- data do termo
+  delivery_date date not null,                           -- entrega do veículo
+  km_out integer,
+  service_done text not null,                            -- serviço executado
+  tested_ok boolean not null,                            -- veículo testado e funcionando
+  parts_returned boolean not null,                       -- peças substituídas entregues
+  warranty text,
+  notes text,
+  commitment_number text not null,
+  fiscal_name text not null,                             -- cópia do fiscal na emissão
+  fiscal_cpf char(11) not null,
+  fiscal_registration text,
+  fiscal_ordinance text not null,
+  fiscal_ordinance_date date not null,
+  responsible_name_snapshot text,                        -- gestor da secretaria na emissão
+  responsible_role_snapshot text,
+  total_amount numeric(14,2) not null,
+  status service_term_status not null default 'emitido',
+  cancel_reason text,
+  canceled_by uuid references app_user(id),
+  canceled_at timestamptz,
+  created_by uuid references app_user(id),
+  created_at timestamptz not null default now(),
+  constraint chk_srt_km_out check (km_out is null or (km_out >= 0 and km_out <= 99999999)),
+  constraint chk_srt_total check (total_amount > 0),
+  constraint chk_srt_cancel check (status <> 'cancelado' or cancel_reason is not null),
+  constraint chk_srt_fiscal_cpf check (is_valid_cpf(fiscal_cpf))
+);
+create unique index if not exists ux_service_term_active
+  on service_receipt_term (service_authorization_id) where status = 'emitido';
+create index if not exists ix_service_term_os on service_receipt_term (service_authorization_id);
+
+create table if not exists service_receipt_term_invoice (
+  id uuid primary key default gen_random_uuid(),
+  term_id uuid not null references service_receipt_term(id) on delete cascade,
+  line_no integer not null,
+  kind text not null check (kind in ('servico','pecas')),
+  supplier_id uuid references supplier(id),              -- opcional: fornecedor do cadastro
+  supplier_name text not null,
+  supplier_cnpj char(14) not null check (supplier_cnpj ~ '^[0-9]{14}$'),
+  invoice_number text not null,
+  invoice_digits text not null,                          -- só dígitos, sem zeros à esquerda (busca)
+  invoice_series text,
+  invoice_date date not null,
+  amount numeric(14,2) not null check (amount > 0)
+);
+create index if not exists ix_service_term_invoice_term on service_receipt_term_invoice (term_id);
+create index if not exists ix_service_term_invoice_digits on service_receipt_term_invoice (invoice_digits);
+
+-- Manutenção: vínculo com o termo e justificativa do registro manual (exigida na tela, Parte 4)
+alter table maintenance add column if not exists service_term_id uuid;
+alter table maintenance add column if not exists manual_reason text;
+alter table maintenance drop constraint if exists maintenance_service_term_id_fkey;
+alter table maintenance add constraint maintenance_service_term_id_fkey
+  foreign key (service_term_id) references service_receipt_term(id);
+create index if not exists ix_maintenance_service_term on maintenance (service_term_id) where service_term_id is not null;
+
+grant select on service_receipt_term, service_receipt_term_invoice to authenticated;
+
+-- ----------------------------------------------------------------------------
+-- Leitura (RLS): admin, usuário (pela secretaria do contrato da OS) e faturamento
+-- não; mecânica não. Sem política de escrita: só as funções gravam.
+-- ----------------------------------------------------------------------------
+alter table service_receipt_term         enable row level security;
+alter table service_receipt_term_invoice enable row level security;
+
+drop policy if exists p_srt_read on service_receipt_term;
+create policy p_srt_read on service_receipt_term for select
+  using (
+    current_user_role() = 'admin'
+    or (current_user_role() = 'usuario'
+        and (current_user_department_id() is null
+             or exists (
+               select 1 from service_authorization a
+               join supplier s on s.id = a.supplier_id
+               where a.id = service_receipt_term.service_authorization_id
+                 and s.department_id = current_user_department_id()
+             )))
+  );
+drop policy if exists p_srti_read on service_receipt_term_invoice;
+create policy p_srti_read on service_receipt_term_invoice for select
+  using (exists (select 1 from service_receipt_term t where t.id = service_receipt_term_invoice.term_id));
+
+-- ----------------------------------------------------------------------------
+-- Travas
+-- ----------------------------------------------------------------------------
+-- OS com termo ativo não muda nem sai, exceto pelas funções (chave de bypass do faturamento).
+create or replace function service_order_lock() returns trigger
+language plpgsql as $$
+declare v_number text;
+begin
+  if current_setting('gerirfrota.billing_bypass', true) = '1' then
+    return coalesce(new, old);
+  end if;
+  select t.number into v_number from service_receipt_term t
+   where t.service_authorization_id = old.id and t.status = 'emitido' limit 1;
+  if v_number is not null then
+    raise exception 'Esta ordem de serviço tem Termo de Recebimento nº %. Para alterar, cancele o termo.', v_number
+      using errcode = 'P0001';
+  end if;
+  return coalesce(new, old);
+end;
+$$;
+drop trigger if exists trg_service_order_lock on service_authorization;
+create trigger trg_service_order_lock
+  before update or delete on service_authorization
+  for each row execute function service_order_lock();
+
+-- Manutenção criada por termo ativo não muda nem sai, exceto pelas funções.
+create or replace function maintenance_term_lock() returns trigger
+language plpgsql as $$
+declare v_number text;
+begin
+  if current_setting('gerirfrota.billing_bypass', true) = '1' then
+    return coalesce(new, old);
+  end if;
+  if old.service_term_id is not null then
+    select t.number into v_number from service_receipt_term t
+     where t.id = old.service_term_id and t.status = 'emitido';
+    if v_number is not null then
+      raise exception 'Esta manutenção tem Termo de Recebimento nº %. Para alterar, cancele o termo na lista de Ordens de Serviço.', v_number
+        using errcode = 'P0001';
+    end if;
+  end if;
+  return coalesce(new, old);
+end;
+$$;
+drop trigger if exists trg_maintenance_term_lock on maintenance;
+create trigger trg_maintenance_term_lock
+  before update or delete on maintenance
+  for each row execute function maintenance_term_lock();
+
+-- Excluir OS: nem com termo (ativo ou cancelado), nem sendo origem de complementar.
+create or replace function delete_service_authorization(p_auth_id uuid) returns void
+language plpgsql security definer set search_path = public, auth as $$
+begin
+  if exists (select 1 from service_authorization c where c.parent_id = p_auth_id) then
+    raise exception 'Esta ordem de serviço é origem de uma OS complementar e não pode ser excluída.';
+  end if;
+  if exists (select 1 from service_receipt_term t where t.service_authorization_id = p_auth_id) then
+    raise exception 'Esta ordem de serviço tem Termo de Recebimento e não pode ser excluída.';
+  end if;
+  delete from service_authorization where id = p_auth_id;
+  if not found then raise exception 'Autorização não encontrada'; end if;
+end;
+$$;
+revoke all on function delete_service_authorization(uuid) from public;
+grant execute on function delete_service_authorization(uuid) to authenticated;
+
+-- ----------------------------------------------------------------------------
+-- Funções
+-- ----------------------------------------------------------------------------
+-- Quem pode: admin e usuário; usuário vinculado a secretaria só a do contrato da OS.
+create or replace function _service_term_require(p_auth_id uuid) returns service_authorization
+language plpgsql stable security definer set search_path = public, auth as $$
+declare v_a service_authorization%rowtype; v_dept uuid;
+begin
+  if current_user_role() is null or current_user_role() not in ('admin','usuario') then
+    raise exception 'Seu perfil não pode emitir ou cancelar termo de serviço.' using errcode = '42501';
+  end if;
+  select * into v_a from service_authorization where id = p_auth_id and deleted_at is null;
+  if v_a.id is null then raise exception 'Ordem de serviço não encontrada.'; end if;
+  if current_user_role() = 'usuario' and current_user_department_id() is not null then
+    select s.department_id into v_dept from supplier s where s.id = v_a.supplier_id;
+    if v_dept is distinct from current_user_department_id() then
+      raise exception 'Você só pode emitir termo para ordens de serviço da sua secretaria.' using errcode = '42501';
+    end if;
+  end if;
+  return v_a;
+end;
+$$;
+revoke all on function _service_term_require(uuid) from public;
+grant execute on function _service_term_require(uuid) to authenticated;
+
+-- Emite o termo. p_invoices: lista de notas
+--   [{"kind":"servico"|"pecas","supplier_id":uuid|null,"supplier_name":text,"supplier_cnpj":text,
+--     "invoice_number":text,"invoice_series":text|null,"invoice_date":"AAAA-MM-DD","amount":numeric}, ...]
+create or replace function emit_service_receipt_term(
+  p_auth_id uuid,
+  p_delivery_date date,
+  p_km_out integer,
+  p_service_done text,
+  p_tested_ok boolean,
+  p_parts_returned boolean,
+  p_invoices jsonb,
+  p_fiscal_name text,
+  p_fiscal_cpf text,
+  p_fiscal_ordinance text,
+  p_fiscal_ordinance_date date,
+  p_warranty text default null,
+  p_notes text default null,
+  p_commitment text default null,
+  p_issue_date date default null,
+  p_fiscal_registration text default null
+) returns uuid
+language plpgsql security definer set search_path = public, auth as $$
+declare
+  v_a service_authorization%rowtype; v_veh vehicle%rowtype; v_dep department%rowtype; v_sup supplier%rowtype;
+  v_issue date := coalesce(p_issue_date, current_date);
+  v_done text := nullif(btrim(coalesce(p_service_done, '')), '');
+  v_commit text := nullif(btrim(coalesce(p_commitment, '')), '');
+  v_fiscal text := nullif(btrim(coalesce(p_fiscal_name, '')), '');
+  v_cpf text := regexp_replace(coalesce(p_fiscal_cpf, ''), '\D', '', 'g');
+  v_ord text := nullif(btrim(regexp_replace(coalesce(p_fiscal_ordinance, ''), '^\s*portaria\s*(n[ºo°.]*)?\s*', '', 'i')), '');
+  v_km integer := p_km_out;
+  v_id uuid; v_total numeric(14,2) := 0; v_n integer := 0; v_has_service boolean := false;
+  inv jsonb; v_kind text; v_sid uuid; v_sname text; v_scnpj text; v_num text; v_series text; v_date date; v_amount numeric(14,2);
+  v_digits text; v_maint_id uuid;
+begin
+  v_a := _service_term_require(p_auth_id);
+  if v_a.os_number is null then
+    raise exception 'Esta autorização é anterior às ordens de serviço numeradas: conclua pelo registro de manutenção.';
+  end if;
+  if v_a.status = 'cancelada' then raise exception 'Esta ordem de serviço está cancelada.'; end if;
+  if v_a.status <> 'emitida' then
+    raise exception 'Esta ordem de serviço já está concluída. Para gerar outro termo, cancele o termo atual.';
+  end if;
+  if exists (select 1 from service_receipt_term t where t.service_authorization_id = p_auth_id and t.status = 'emitido') then
+    raise exception 'Esta ordem de serviço já tem Termo de Recebimento. Para gerar outro, cancele o termo atual.';
+  end if;
+  perform 1 from service_authorization where id = p_auth_id for update;
+  select * into v_veh from vehicle where id = v_a.vehicle_id;
+  select * into v_sup from supplier where id = v_a.supplier_id;
+  select * into v_dep from department where id = v_sup.department_id;
+
+  -- Serviço, vistoria, datas
+  if v_done is null then raise exception 'Informe o serviço executado.'; end if;
+  if not coalesce(p_tested_ok, false) then raise exception 'Confirme que o veículo foi testado e está funcionando.'; end if;
+  if not coalesce(p_parts_returned, false) then raise exception 'Confirme que as peças substituídas foram entregues para conferência.'; end if;
+  if p_delivery_date is null then raise exception 'Informe a data de entrega do veículo.'; end if;
+  if p_delivery_date < v_a.date then
+    raise exception 'A data de entrega não pode ser anterior à ordem de serviço (%).', to_char(v_a.date, 'DD/MM/YYYY');
+  end if;
+  if p_delivery_date > current_date then raise exception 'A data de entrega não pode ser futura.'; end if;
+  if v_issue > current_date then raise exception 'A data do termo não pode ser futura.'; end if;
+  if v_issue < p_delivery_date then raise exception 'A data do termo não pode ser anterior à data de entrega.'; end if;
+  if v_issue < v_a.date then
+    raise exception 'A data do termo não pode ser anterior à ordem de serviço (%).', to_char(v_a.date, 'DD/MM/YYYY');
+  end if;
+
+  -- Km na entrega
+  if v_veh.vehicle_type_code = 99 then
+    v_km := 99999999;
+  else
+    if v_km is null then raise exception 'Informe o km do veículo na entrega.'; end if;
+    if v_km < 0 or v_km >= 99999999 then raise exception 'Km na entrega inválido.'; end if;
+    if v_a.km_in is not null and v_km < v_a.km_in then
+      raise exception 'O km na entrega (%) é menor que o km na entrada (%).', v_km, v_a.km_in;
+    end if;
+  end if;
+
+  -- Empenho: vem da OS; se vazio, é informado aqui e gravado na OS
+  v_commit := coalesce(v_commit, nullif(btrim(coalesce(v_a.commitment_number, '')), ''));
+  if v_commit is null then raise exception 'Informe o número do empenho.'; end if;
+
+  -- Fiscal do contrato
+  if v_fiscal is null then raise exception 'Informe o fiscal do contrato.'; end if;
+  if v_cpf = '' then raise exception 'Informe o CPF do fiscal do contrato.'; end if;
+  if not is_valid_cpf(v_cpf) then raise exception 'CPF do fiscal inválido.'; end if;
+  if v_ord is null then raise exception 'Informe o número da portaria do fiscal.'; end if;
+  if p_fiscal_ordinance_date is null then raise exception 'Informe a data da portaria do fiscal.'; end if;
+  if p_fiscal_ordinance_date > current_date then raise exception 'A data da portaria não pode ser futura.'; end if;
+
+  -- Notas fiscais
+  if p_invoices is null or jsonb_typeof(p_invoices) <> 'array' or jsonb_array_length(p_invoices) = 0 then
+    raise exception 'Informe pelo menos uma nota fiscal.';
+  end if;
+  for inv in select * from jsonb_array_elements(p_invoices) loop
+    v_n := v_n + 1;
+    v_kind := inv ->> 'kind';
+    if v_kind not in ('servico','pecas') then raise exception 'Nota %: tipo inválido (serviço ou peças).', v_n; end if;
+    v_sid := nullif(inv ->> 'supplier_id', '')::uuid;
+    if v_sid is not null then
+      select legal_name, cnpj into v_sname, v_scnpj from supplier where id = v_sid;
+      if v_sname is null then raise exception 'Nota %: fornecedor não encontrado.', v_n; end if;
+      v_sname := coalesce(nullif(btrim(coalesce(inv ->> 'supplier_name', '')), ''), v_sname);
+    else
+      v_sname := nullif(btrim(coalesce(inv ->> 'supplier_name', '')), '');
+      v_scnpj := regexp_replace(coalesce(inv ->> 'supplier_cnpj', ''), '\D', '', 'g');
+    end if;
+    if v_sname is null then raise exception 'Nota %: informe o fornecedor.', v_n; end if;
+    if v_scnpj !~ '^[0-9]{14}$' then raise exception 'Nota %: CNPJ do fornecedor deve ter 14 dígitos.', v_n; end if;
+    v_num := nullif(btrim(coalesce(inv ->> 'invoice_number', '')), '');
+    if v_num is null then raise exception 'Nota %: informe o número da nota fiscal.', v_n; end if;
+    v_series := nullif(btrim(coalesce(inv ->> 'invoice_series', '')), '');
+    begin
+      v_date := (inv ->> 'invoice_date')::date;
+    exception when others then
+      raise exception 'Nota %: data inválida.', v_n;
+    end;
+    if v_date is null then raise exception 'Nota %: informe a data da nota fiscal.', v_n; end if;
+    if v_date < v_a.date then
+      raise exception 'Nota %: a data (%) é anterior à ordem de serviço (%).', v_n, to_char(v_date, 'DD/MM/YYYY'), to_char(v_a.date, 'DD/MM/YYYY');
+    end if;
+    if v_date > current_date then raise exception 'Nota %: a data não pode ser futura.', v_n; end if;
+    if v_date > v_issue then raise exception 'Nota %: a data (%) é posterior à data do termo.', v_n, to_char(v_date, 'DD/MM/YYYY'); end if;
+    if coalesce(inv ->> 'amount', '') !~ '^[0-9]+(\.[0-9]+)?$' then raise exception 'Nota %: valor inválido.', v_n; end if;
+    v_amount := round((inv ->> 'amount')::numeric, 2);
+    if v_amount <= 0 then raise exception 'Nota %: o valor deve ser maior que zero.', v_n; end if;
+    v_total := v_total + v_amount;
+    if v_kind = 'servico' then v_has_service := true; end if;
+  end loop;
+  if not v_has_service then raise exception 'Informe a nota fiscal do serviço (da mecânica).'; end if;
+  if v_total > v_a.estimated_value then
+    raise exception 'O total das notas (R$ %) passa do estimado na OS (R$ %). Emita uma OS complementar para a diferença antes de gerar o termo.',
+      to_char(v_total, 'FM999G999G990D00'), to_char(v_a.estimated_value, 'FM999G999G990D00');
+  end if;
+
+  -- Grava o termo (cópias do fiscal e do gestor)
+  insert into service_receipt_term (
+    service_authorization_id, number, issue_date, delivery_date, km_out, service_done,
+    tested_ok, parts_returned, warranty, notes, commitment_number,
+    fiscal_name, fiscal_cpf, fiscal_registration, fiscal_ordinance, fiscal_ordinance_date,
+    responsible_name_snapshot, responsible_role_snapshot, total_amount, created_by
+  ) values (
+    p_auth_id, v_a.os_number, v_issue, p_delivery_date, v_km, v_done,
+    true, true, nullif(btrim(coalesce(p_warranty, '')), ''), nullif(btrim(coalesce(p_notes, '')), ''), v_commit,
+    v_fiscal, v_cpf, nullif(btrim(coalesce(p_fiscal_registration, '')), ''), v_ord, p_fiscal_ordinance_date,
+    _responsible_or_issuer(coalesce(v_dep.responsible_name, v_a.responsible_name_snapshot)),
+    coalesce(v_dep.responsible_role, v_a.responsible_role_snapshot),
+    v_total, auth.uid()
+  ) returning id into v_id;
+
+  v_n := 0;
+  for inv in select * from jsonb_array_elements(p_invoices) loop
+    v_n := v_n + 1;
+    v_sid := nullif(inv ->> 'supplier_id', '')::uuid;
+    if v_sid is not null then
+      select legal_name, cnpj into v_sname, v_scnpj from supplier where id = v_sid;
+      v_sname := coalesce(nullif(btrim(coalesce(inv ->> 'supplier_name', '')), ''), v_sname);
+    else
+      v_sname := btrim(inv ->> 'supplier_name');
+      v_scnpj := regexp_replace(coalesce(inv ->> 'supplier_cnpj', ''), '\D', '', 'g');
+    end if;
+    v_num := btrim(inv ->> 'invoice_number');
+    v_digits := ltrim(regexp_replace(v_num, '\D', '', 'g'), '0');
+    if v_digits = '' then v_digits := '0'; end if;
+    insert into service_receipt_term_invoice (
+      term_id, line_no, kind, supplier_id, supplier_name, supplier_cnpj,
+      invoice_number, invoice_digits, invoice_series, invoice_date, amount
+    ) values (
+      v_id, v_n, inv ->> 'kind', v_sid, v_sname, v_scnpj,
+      v_num, v_digits, nullif(btrim(coalesce(inv ->> 'invoice_series', '')), ''),
+      (inv ->> 'invoice_date')::date, round((inv ->> 'amount')::numeric, 2)
+    );
+  end loop;
+
+  -- Empenho na OS, manutenção concluída e OS concluída (passando pelas travas)
+  perform set_config('gerirfrota.billing_bypass', '1', true);
+  update service_authorization
+     set commitment_number = v_commit,
+         commitment_set_by = case when v_commit is distinct from v_a.commitment_number then auth.uid() else commitment_set_by end,
+         commitment_set_at = case when v_commit is distinct from v_a.commitment_number then now() else commitment_set_at end
+   where id = p_auth_id;
+  insert into maintenance (
+    authorization_id, service_term_id, vehicle_id, supplier_id, kind, status,
+    open_date, close_date, km_at_service, description, total_value,
+    responsible_name, notes, created_by
+  ) values (
+    p_auth_id, v_id, v_a.vehicle_id, v_a.supplier_id, v_a.service_kind::text::maintenance_kind, 'concluida',
+    v_a.date, p_delivery_date, case when v_km = 99999999 then null else v_km end, v_done, v_total,
+    v_a.responsible_name, nullif(btrim(coalesce(p_notes, '')), ''), auth.uid()
+  ) returning id into v_maint_id;
+  -- (o gatilho da manutenção já passa a OS a 'utilizada'; garante mesmo assim)
+  update service_authorization set status = 'utilizada' where id = p_auth_id and status = 'emitida';
+  perform set_config('gerirfrota.billing_bypass', '0', true);
+
+  -- Km de entrega vira referência do veículo
+  if v_veh.vehicle_type_code <> 99 then
+    update vehicle set current_km = greatest(current_km, v_km) where id = v_a.vehicle_id;
+  end if;
+
+  return v_id;
+end;
+$$;
+revoke all on function emit_service_receipt_term(uuid,date,integer,text,boolean,boolean,jsonb,text,text,text,date,text,text,text,date,text) from public;
+grant execute on function emit_service_receipt_term(uuid,date,integer,text,boolean,boolean,jsonb,text,text,text,date,text,text,text,date,text) to authenticated;
+
+-- Cancela o termo: a manutenção criada por ele sai (soft) e a OS volta a Emitida.
+-- O km do veículo não volta.
+create or replace function cancel_service_receipt_term(p_term uuid, p_reason text) returns void
+language plpgsql security definer set search_path = public, auth as $$
+declare v_t service_receipt_term%rowtype; v_a service_authorization%rowtype; v_r text := btrim(coalesce(p_reason, ''));
+begin
+  select * into v_t from service_receipt_term where id = p_term for update;
+  if v_t.id is null then raise exception 'Termo de Recebimento não encontrado.'; end if;
+  v_a := _service_term_require(v_t.service_authorization_id);
+  if v_t.status = 'cancelado' then raise exception 'Este termo já está cancelado.'; end if;
+  if length(v_r) < 5 then raise exception 'Informe a justificativa do cancelamento.'; end if;
+
+  perform set_config('gerirfrota.billing_bypass', '1', true);
+  update maintenance set deleted_at = now()
+   where service_term_id = p_term and deleted_at is null;
+  update service_receipt_term
+     set status = 'cancelado', cancel_reason = v_r, canceled_by = auth.uid(), canceled_at = now()
+   where id = p_term;
+  update service_authorization set status = 'emitida' where id = v_t.service_authorization_id and status = 'utilizada';
+  perform set_config('gerirfrota.billing_bypass', '0', true);
+end;
+$$;
+revoke all on function cancel_service_receipt_term(uuid, text) from public;
+grant execute on function cancel_service_receipt_term(uuid, text) to authenticated;
+
+-- Notas de um termo (emitido ou cancelado), para a tela e o PDF. Só a quem pode ver o termo.
+create or replace function service_receipt_term_invoices(p_term uuid)
+returns table (
+  line_no integer, kind text, supplier_id uuid, supplier_name text, supplier_cnpj text,
+  invoice_number text, invoice_series text, invoice_date date, amount numeric
+)
+language plpgsql stable security definer set search_path = public, auth as $$
+#variable_conflict use_column
+declare v_dept uuid; v_role user_role;
+begin
+  select s.department_id into v_dept
+    from service_receipt_term t
+    join service_authorization a on a.id = t.service_authorization_id
+    join supplier s on s.id = a.supplier_id
+   where t.id = p_term;
+  if not found then return; end if;
+  v_role := current_user_role();
+  if v_role = 'admin' then null;
+  elsif v_role = 'usuario' then
+    if current_user_department_id() is not null
+       and current_user_department_id() is distinct from v_dept then return; end if;
+  else
+    return;
+  end if;
+  return query
+    select i.line_no, i.kind, i.supplier_id, i.supplier_name, i.supplier_cnpj::text,
+           i.invoice_number, i.invoice_series, i.invoice_date, i.amount::numeric
+      from service_receipt_term_invoice i
+     where i.term_id = p_term
+     order by i.line_no;
+end;
+$$;
+revoke all on function service_receipt_term_invoices(uuid) from public;
+grant execute on function service_receipt_term_invoices(uuid) to authenticated;
+
+-- =============================================================================
 -- 13) Força reload do schema cache do PostgREST
 -- =============================================================================
 notify pgrst, 'reload schema';
