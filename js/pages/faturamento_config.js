@@ -10,8 +10,11 @@ import { isAdmin } from '../auth.js';
 
 let _entity = null;
 let _depts = [];
-let _contracts = [];   // fornecedores que vendem combustível (posto / ambos)
+let _contracts = [];   // contratos: postos (combustível) e mecânicas (ordem de serviço)
+let _usernames = [];   // logins: o campo "Responsável" da secretaria não pode ser um login
 let _search = '';
+const KINDS = ['posto', 'ambos', 'mecanica'];
+const KIND_LABEL = { posto: 'Posto', mecanica: 'Mecânica', ambos: 'Posto + Mecânica' };
 
 const PRICE_LABEL = { fixo: 'Preço fixo por litro', desconto_bomba: 'Desconto sobre o preço da bomba' };
 
@@ -52,29 +55,37 @@ function stateCard(icon, title, text) {
 
 // false quando o banco ainda não tem a opção de numeração (versão anterior)
 let _hasNumbering = true;
+// false quando o banco ainda não tem a numeração das ordens de serviço (Parte 1 da OS)
+let _hasOsNumbering = true;
 // false quando o banco ainda não tem CPF do fiscal e data da portaria (ajustes v2.1)
 let _hasFiscalDoc = true;
 const CONTRACT_COLS = 'id, kind, legal_name, trade_name, cnpj, department_id, contract_number, price_type, fiscal_name, fiscal_registration, fiscal_ordinance';
 
 async function loadAll() {
   const cpfs = loadFiscalCpfs();
-  let [e, d, s] = await Promise.all([
-    supabase.from('entity').select('id, billing_start_date, billing_numbering').maybeSingle(),
+  let [e, d, s, u] = await Promise.all([
+    supabase.from('entity').select('id, billing_start_date, billing_numbering, service_order_numbering').maybeSingle(),
     supabase.from('department')
       .select('id, acronym, name, cnpj, responsible_name, responsible_role')
       .order('acronym'),
     supabase.from('supplier')
       .select(CONTRACT_COLS + ', fiscal_ordinance_date')
-      .in('kind', ['posto', 'ambos'])
+      .in('kind', KINDS)
       .order('legal_name'),
+    supabase.rpc('admin_list_users'),
   ]);
   _hasFiscalDoc = true;
   if (s.error && /fiscal_ordinance_date/.test(s.error.message || '')) {
     _hasFiscalDoc = false;
-    s = await supabase.from('supplier').select(CONTRACT_COLS).in('kind', ['posto', 'ambos']).order('legal_name');
+    s = await supabase.from('supplier').select(CONTRACT_COLS).in('kind', KINDS).order('legal_name');
   }
   const c = await cpfs;
   if (!c.available) _hasFiscalDoc = false;
+  _hasOsNumbering = true;
+  if (e.error && /service_order_numbering/.test(e.error.message || '')) {
+    _hasOsNumbering = false;
+    e = await supabase.from('entity').select('id, billing_start_date, billing_numbering').maybeSingle();
+  }
   _hasNumbering = true;
   if (e.error && /billing_numbering/.test(e.error.message || '')) {
     _hasNumbering = false;
@@ -85,6 +96,7 @@ async function loadAll() {
   _entity = e.data;
   _depts = d.data || [];
   _contracts = (s.data || []).map(x => ({ ...x, fiscal_cpf: c.map.get(x.id) || null }));
+  _usernames = u.error ? [] : (u.data || []).map(x => String(x.username || '').toLowerCase());
   return 'ok';
 }
 
@@ -114,7 +126,7 @@ function computePending() {
     list.push({ level: 'block', target: 'cfg-general', text: 'Data de início do faturamento não definida. Sem ela, nenhuma Ordem de Fornecimento pode ser emitida.' });
   }
   _contracts.filter(c => !c.department_id).forEach(c => {
-    list.push({ level: 'block', target: `cfg-c-${c.id}`, text: `Contrato de ${c.trade_name || c.legal_name} sem secretaria: não aparece para faturar.` });
+    list.push({ level: 'block', target: `cfg-c-${c.id}`, text: `Contrato de ${c.trade_name || c.legal_name} sem secretaria: ${c.kind === 'mecanica' ? 'não recebe ordem de serviço' : 'não aparece para faturar'}.` });
   });
   _depts.forEach(d => {
     const m = deptMissing(d);
@@ -206,6 +218,25 @@ function renderConfig() {
       <p class="cfg-help cfg-numbering-note" id="cfg-numbering-note">${numberingNote(_entity?.billing_numbering)}</p>
     </div>` : ''}
 
+    ${_hasOsNumbering ? `
+    <div class="card" id="cfg-os-numbering">
+      <h2 class="cfg-title">Numeração das ordens de serviço</h2>
+      <p class="cfg-help">A Ordem de Serviço (manutenção) tem sequência própria, única para o município e reiniciada a cada ano. Ligue o número informado quando a ordem já é emitida em outro sistema.</p>
+      <div class="cfg-row is-inline" data-row="os_numbering">
+        <div class="cfg-fields cfg-fields-wide">
+          <div class="field">
+            <label class="field-label" for="cfg-os-numbering-mode">Numeração</label>
+            <select class="select" id="cfg-os-numbering-mode" data-f="service_order_numbering">
+              <option value="auto" ${_entity?.service_order_numbering !== 'opcional' ? 'selected' : ''}>Só automática: o Gerir Frota numera (001/2026, 002/2026…)</option>
+              <option value="opcional" ${_entity?.service_order_numbering === 'opcional' ? 'selected' : ''}>Automática, com número informado opcional</option>
+            </select>
+          </div>
+        </div>
+        ${rowFoot()}
+      </div>
+      <p class="cfg-help cfg-numbering-note" id="cfg-os-numbering-note">${osNumberingNote(_entity?.service_order_numbering)}</p>
+    </div>` : ''}
+
     <div class="card" id="cfg-depts">
       <h2 class="cfg-title">Secretarias</h2>
       <p class="cfg-help">Cada secretaria é uma unidade gestora, com CNPJ próprio. O responsável assina os documentos. São os mesmos campos do cadastro de Secretarias: o que for preenchido aqui aparece lá, e vice-versa.</p>
@@ -214,7 +245,7 @@ function renderConfig() {
 
     <div class="card" id="cfg-contracts">
       <h2 class="cfg-title">Contratos</h2>
-      <p class="cfg-help">Cada cadastro de posto é um contrato com uma secretaria. Para um contrato novo com o mesmo posto, cadastre um novo fornecedor com o novo número. São os mesmos campos do cadastro de Fornecedores.</p>
+      <p class="cfg-help">Cada cadastro de posto ou mecânica é um contrato com uma secretaria. Para um contrato novo com o mesmo fornecedor, cadastre um novo fornecedor com o novo número. O fiscal assina o Termo de Recebimento (combustível ou serviço). São os mesmos campos do cadastro de Fornecedores.</p>
       <div class="table-toolbar">
         <div class="search ${_search ? 'has-value' : ''}" id="cfg-search-box">
           ${icons.search}
@@ -284,7 +315,7 @@ function contractRowHTML(c) {
       <div class="cfg-head">
         <div class="cell-stack">
           <strong class="cfg-name">${esc(c.trade_name || c.legal_name)}</strong>
-          <span class="cfg-sub">CNPJ ${esc(fmtCNPJ(c.cnpj))}</span>
+          <span class="cfg-sub">CNPJ ${esc(fmtCNPJ(c.cnpj))} · ${esc(KIND_LABEL[c.kind] || c.kind)}</span>
         </div>
         <span class="cfg-chip" data-chip>${chipHTML(contractMissing(c))}</span>
       </div>
@@ -298,10 +329,11 @@ function contractRowHTML(c) {
           <input class="input" data-f="contract_number" maxlength="30"
                  value="${esc(c.contract_number || '')}" placeholder="ex: 012/2025">
         </div>
+        ${c.kind === 'mecanica' ? '' : `
         <div class="field">
           <label class="field-label">Tipo de preço</label>
           <select class="select" data-f="price_type">${priceOptions}</select>
-        </div>
+        </div>`}
         <div class="field">
           <label class="field-label">Fiscal do contrato</label>
           <input class="input" data-f="fiscal_name" maxlength="120"
@@ -390,6 +422,7 @@ function bindConfig(body) {
     if (e.target.dataset?.f) markDirty(e.target.closest('.cfg-row'));
     // a explicação acompanha a opção escolhida, antes mesmo de salvar
     if (e.target.id === 'cfg-numbering-mode') document.getElementById('cfg-numbering-note').textContent = numberingNote(e.target.value);
+    if (e.target.id === 'cfg-os-numbering-mode') document.getElementById('cfg-os-numbering-note').textContent = osNumberingNote(e.target.value);
   });
   body.addEventListener('click', (e) => {
     const save = e.target.closest('[data-save]');
@@ -444,6 +477,12 @@ function numberingNote(mode) {
     : 'A sequência é única para todo o município e recomeça em 001 a cada ano: a ordem seguinte recebe o próximo número, seja de qual secretaria for. O número de uma ordem cancelada não é reaproveitado.';
 }
 
+function osNumberingNote(mode) {
+  return mode === 'opcional'
+    ? 'Ao emitir a ordem de serviço, o usuário pode digitar o número que ela recebeu no outro sistema ou deixar em branco para o Gerir Frota numerar. O mesmo número não se repete no ano, seja digitado ou automático.'
+    : 'O Gerir Frota numera todas as ordens de serviço: a sequência é única para o município e recomeça em 001 a cada ano. O número de uma ordem cancelada não é reaproveitado.';
+}
+
 function readRow(row) {
   const v = {};
   row.querySelectorAll('[data-f]').forEach(i => { v[i.dataset.f] = (i.value || '').trim(); });
@@ -467,11 +506,19 @@ async function saveRow(row) {
   } else if (kind === 'numbering') {
     table = 'entity'; match = { id: 1 };
     payload = { billing_numbering: v.billing_numbering === 'informado' ? 'informado' : 'auto' };
+  } else if (kind === 'os_numbering') {
+    table = 'entity'; match = { id: 1 };
+    payload = { service_order_numbering: v.service_order_numbering === 'opcional' ? 'opcional' : 'auto' };
   } else if (kind === 'dept') {
     const cnpj = onlyDigits(v.cnpj);
     if (cnpj && !isValidCNPJ(cnpj)) {
       setStatus(row, 'CNPJ inválido. Confira os dígitos.', 'error');
       row.querySelector('[data-f="cnpj"]').focus();
+      return;
+    }
+    if (v.responsible_name && _usernames.includes(v.responsible_name.toLowerCase())) {
+      setStatus(row, 'Informe o nome completo do responsável, não o usuário de login.', 'error');
+      row.querySelector('[data-f="responsible_name"]').focus();
       return;
     }
     table = 'department'; match = { id };
@@ -485,11 +532,12 @@ async function saveRow(row) {
     payload = {
       department_id: v.department_id || null,
       contract_number: v.contract_number || null,
-      price_type: v.price_type === 'desconto_bomba' ? 'desconto_bomba' : 'fixo',
       fiscal_name: v.fiscal_name || null,
       fiscal_registration: v.fiscal_registration || null,
       fiscal_ordinance: (_hasFiscalDoc ? normOrdinance(v.fiscal_ordinance) : v.fiscal_ordinance) || null,
     };
+    // Tipo de preço é só do combustível: a linha de mecânica não tem o campo
+    if (v.price_type !== undefined) payload.price_type = v.price_type === 'desconto_bomba' ? 'desconto_bomba' : 'fixo';
     if (_hasFiscalDoc) {
       payload.fiscal_ordinance_date = v.fiscal_ordinance_date || null;
       fiscalCpf = onlyDigits(v.fiscal_cpf);
@@ -524,7 +572,7 @@ async function saveRow(row) {
   }
 
   // Estado local + pendências, sem redesenhar a página (mantém foco e rolagem)
-  if (kind === 'general' || kind === 'numbering') Object.assign(_entity, payload);
+  if (kind === 'general' || kind === 'numbering' || kind === 'os_numbering') Object.assign(_entity, payload);
   else Object.assign((kind === 'dept' ? _depts : _contracts).find(x => x.id === id), payload,
                      fiscalCpf !== undefined ? { fiscal_cpf: fiscalCpf || null } : {});
   row.classList.remove('is-dirty');
@@ -536,10 +584,13 @@ async function saveRow(row) {
   }
   document.getElementById('cfg-pending').innerHTML = pendingHTML();
   if (kind === 'numbering') document.getElementById('cfg-numbering-note').textContent = numberingNote(payload.billing_numbering);
+  if (kind === 'os_numbering') document.getElementById('cfg-os-numbering-note').textContent = osNumberingNote(payload.service_order_numbering);
   setStatus(row, kind === 'general' && payload.billing_start_date
     ? `Salvo. Faturamento a partir de ${fmtDate(payload.billing_start_date)}.`
     : kind === 'numbering'
       ? (payload.billing_numbering === 'informado' ? 'Salvo. As próximas ordens pedem o número.' : 'Salvo. As próximas ordens são numeradas pelo sistema.')
+    : kind === 'os_numbering'
+      ? (payload.service_order_numbering === 'opcional' ? 'Salvo. As próximas ordens de serviço aceitam número informado.' : 'Salvo. As ordens de serviço são numeradas pelo sistema.')
       : 'Salvo.', 'ok');
   toast('Configuração salva.', 'success');
 }

@@ -14,7 +14,7 @@ export const isMobile = () => window.matchMedia('(max-width: 900px)').matches;
 
 // Catálogo de páginas — único lugar onde definir nav + permissões + breadcrumb
 export const NAV = [
-  { path: '/dashboard',      label: 'Dashboard',        icon: 'dashboard',  roles: ['admin','usuario','fornecedor'] },
+  { path: '/dashboard',      label: 'Dashboard',        icon: 'dashboard',  roles: ['admin','usuario'] },
   { group: 'Cadastros' },
   { path: '/entidade',       label: 'Entidade',         icon: 'shield',     roles: ['admin','usuario'] },
   { path: '/usuarios',       label: 'Usuários',         icon: 'users',      roles: ['admin'] },

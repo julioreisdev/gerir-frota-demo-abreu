@@ -1882,5 +1882,497 @@ revoke all on function receipt_term_fuelings(uuid) from public;
 grant execute on function receipt_term_fuelings(uuid) to authenticated;
 
 
+-- =============================================================================
+-- 22) ORDEM DE SERVIÇO — Parte 1: base (out/2026)
+--   a) Cargo do usuário (assina a Ordem de Serviço que emitir).
+--   b) Responsável da secretaria nunca é um login. Nos documentos, campo vazio
+--      (ou igual a um login) vira o nome completo de quem emitiu.
+--   c) Numeração das ordens de serviço na entidade: 'auto' (só automática) ou
+--      'opcional' (aceita número informado de outro sistema).
+--   d) A autorização de manutenção passa a ser a Ordem de Serviço: colunas e
+--      índices novos, data futura bloqueada, contrato com OS ativa não troca
+--      de secretaria.
+--   e) Funções: emit_service_order, update_service_order,
+--      set_service_order_commitment, cancel_service_order. As funções de
+--      emissão que já existiam (emit_service_authorization e a versão com
+--      motorista) não mudam: a nova chama a antiga e grava o resto.
+-- Idempotente.
+-- =============================================================================
+
+-- a) Cargo do usuário
+alter table app_user add column if not exists job_title text;
+
+drop function if exists admin_list_users();
+create or replace function admin_list_users()
+returns table (
+  id uuid, username text, full_name text, role user_role, active boolean,
+  supplier_id uuid, monthly_authorization_limit numeric,
+  access_start date, access_end date, created_at timestamptz, email text,
+  job_title text
+)
+language plpgsql security definer set search_path = public, auth as $$
+begin
+  perform _require_admin();
+  return query
+    select au.id::uuid,
+           au.username::text,
+           au.full_name::text,
+           au.role::user_role,
+           au.active::boolean,
+           au.supplier_id::uuid,
+           au.monthly_authorization_limit::numeric,
+           au.access_start::date,
+           au.access_end::date,
+           au.created_at::timestamptz,
+           u.email::text,
+           au.job_title::text
+      from app_user au
+      left join auth.users u on u.id = au.id
+      order by au.created_at;
+end;
+$$;
+revoke all on function admin_list_users() from public;
+grant execute on function admin_list_users() to authenticated;
+
+-- b) Responsável da secretaria
+-- O campo "Responsável" não aceita um nome de login.
+create or replace function department_responsible_check() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if new.responsible_name is not null
+     and exists (select 1 from app_user u where lower(u.username) = lower(btrim(new.responsible_name))) then
+    raise exception 'Informe o nome completo do responsável, não o usuário de login.' using errcode = 'P0001';
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists trg_department_responsible_check on department;
+create trigger trg_department_responsible_check
+  before insert or update of responsible_name on department
+  for each row execute function department_responsible_check();
+
+-- Nome que assina pela secretaria: o responsável cadastrado; se vazio ou igual a
+-- um login, o nome completo de quem está emitindo. Nunca o login.
+create or replace function _responsible_or_issuer(p_name text) returns text
+language plpgsql stable security definer set search_path = public, auth as $$
+declare v text := nullif(btrim(coalesce(p_name, '')), ''); v_issuer text;
+begin
+  if v is not null and not exists (select 1 from app_user u where lower(u.username) = lower(v)) then
+    return v;
+  end if;
+  select full_name into v_issuer from app_user where id = auth.uid();
+  return coalesce(v_issuer, v);
+end;
+$$;
+revoke all on function _responsible_or_issuer(text) from public;
+grant execute on function _responsible_or_issuer(text) to authenticated;
+
+-- Ordem de Fornecimento e Termo de Recebimento do combustível: a cópia do
+-- responsável passa pela regra acima na gravação (as funções não mudam).
+create or replace function fill_responsible_snapshot() returns trigger
+language plpgsql security definer set search_path = public, auth as $$
+begin
+  new.responsible_name_snapshot := _responsible_or_issuer(new.responsible_name_snapshot);
+  return new;
+end;
+$$;
+drop trigger if exists trg_supply_order_responsible on supply_order;
+create trigger trg_supply_order_responsible
+  before insert on supply_order
+  for each row execute function fill_responsible_snapshot();
+drop trigger if exists trg_receipt_term_responsible on receipt_term;
+create trigger trg_receipt_term_responsible
+  before insert on receipt_term
+  for each row execute function fill_responsible_snapshot();
+
+-- c) Numeração das ordens de serviço
+alter table entity add column if not exists service_order_numbering text not null default 'auto';
+alter table entity drop constraint if exists chk_entity_service_order_numbering;
+alter table entity add constraint chk_entity_service_order_numbering
+  check (service_order_numbering in ('auto','opcional'));
+
+-- d) Autorização de manutenção = Ordem de Serviço
+alter table service_authorization add column if not exists os_year smallint;
+alter table service_authorization add column if not exists os_seq integer;
+alter table service_authorization add column if not exists os_number text;                 -- '001/2026'
+alter table service_authorization add column if not exists os_external boolean not null default false;  -- nº informado de outro sistema
+alter table service_authorization add column if not exists parent_id uuid references service_authorization(id);  -- OS complementar
+alter table service_authorization add column if not exists commitment_number text;
+alter table service_authorization add column if not exists commitment_set_by uuid references app_user(id);
+alter table service_authorization add column if not exists commitment_set_at timestamptz;
+alter table service_authorization add column if not exists km_in integer;
+alter table service_authorization drop constraint if exists chk_service_order_km_in;
+alter table service_authorization add constraint chk_service_order_km_in
+  check (km_in is null or (km_in >= 0 and km_in <= 99999999));
+alter table service_authorization add column if not exists budget_ref text;                -- 'nº 318, de 27/10/2026'
+alter table service_authorization add column if not exists value_services numeric(12,2);
+alter table service_authorization add column if not exists value_parts    numeric(12,2);
+alter table service_authorization drop constraint if exists chk_service_order_values;
+alter table service_authorization add constraint chk_service_order_values
+  check ((value_services is null or value_services >= 0) and (value_parts is null or value_parts >= 0));
+alter table service_authorization add column if not exists department_name_snapshot text;
+alter table service_authorization add column if not exists department_cnpj_snapshot text;
+alter table service_authorization add column if not exists responsible_name_snapshot text;   -- gestor da secretaria
+alter table service_authorization add column if not exists responsible_role_snapshot text;
+alter table service_authorization add column if not exists supplier_cnpj_snapshot text;
+alter table service_authorization add column if not exists contract_number_snapshot text;
+alter table service_authorization add column if not exists issuer_name_snapshot text;        -- quem emitiu: nome completo
+alter table service_authorization add column if not exists issuer_role_snapshot text;        -- quem emitiu: cargo
+alter table service_authorization add column if not exists cancel_reason text;
+alter table service_authorization add column if not exists canceled_by uuid references app_user(id);
+alter table service_authorization add column if not exists canceled_at timestamptz;
+create unique index if not exists ux_service_order_year_seq
+  on service_authorization (os_year, os_seq);
+create unique index if not exists ux_service_order_number_active
+  on service_authorization (os_year, upper(btrim(os_number)))
+  where os_number is not null and status <> 'cancelada';
+create index if not exists ix_service_order_parent on service_authorization (parent_id) where parent_id is not null;
+
+-- Sem data futura, como na autorização de abastecimento
+create or replace function block_future_date_service() returns trigger
+language plpgsql as $$
+begin
+  if (tg_op = 'INSERT' or new.date is distinct from old.date) and new.date > local_today() then
+    raise exception 'A data da ordem de serviço não pode ser posterior a hoje.' using errcode = 'P0001';
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists trg_servauth_block_future_date on service_authorization;
+create trigger trg_servauth_block_future_date
+  before insert or update of date on service_authorization
+  for each row execute function block_future_date_service();
+
+-- Contrato com Ordem de Fornecimento ou Ordem de Serviço ativa não troca de secretaria
+create or replace function supplier_billing_lock() returns trigger
+language plpgsql as $$
+begin
+  if new.department_id is distinct from old.department_id then
+    if exists (select 1 from supply_order o where o.supplier_id = old.id and o.status <> 'cancelada') then
+      raise exception 'Este contrato tem Ordem de Fornecimento emitida e não pode mudar de secretaria.'
+        using errcode = 'P0001';
+    end if;
+    if exists (select 1 from service_authorization a
+                where a.supplier_id = old.id and a.os_number is not null
+                  and a.status <> 'cancelada' and a.deleted_at is null) then
+      raise exception 'Este contrato tem Ordem de Serviço emitida e não pode mudar de secretaria.'
+        using errcode = 'P0001';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists trg_supplier_billing_lock on supplier;
+create trigger trg_supplier_billing_lock
+  before update on supplier
+  for each row execute function supplier_billing_lock();
+
+-- e) Funções
+
+-- Linhas de valor no texto do QR Code: "Serviços", "Peças" e "Valor estimado".
+create or replace function _qr_service_values(p_qr text, p_services numeric, p_parts numeric, p_total numeric) returns text
+language plpgsql immutable as $$
+declare v text := coalesce(p_qr, '');
+begin
+  v := regexp_replace(v, E'\nServiços: [^\n]*', '');
+  v := regexp_replace(v, E'\nPeças: [^\n]*', '');
+  v := regexp_replace(v, E'\nValor estimado: [^\n]*',
+         E'\nServiços: R$ ' || to_char(p_services, 'FM999990D90') ||
+         E'\nPeças: R$ ' || to_char(p_parts, 'FM999990D90') ||
+         E'\nValor estimado: R$ ' || to_char(p_total, 'FM999990D90'));
+  return v;
+end;
+$$;
+
+-- Emite a Ordem de Serviço. Chama a emissão de sempre e grava o resto na
+-- mesma transação: se qualquer validação falhar, nada é emitido.
+-- p_number: só quando a entidade está em 'opcional'; em branco = automático.
+create or replace function emit_service_order(
+  p_date date,
+  p_vehicle_id uuid,
+  p_supplier_id uuid,
+  p_service_kind service_kind,
+  p_description text,
+  p_value_services numeric,
+  p_value_parts numeric,
+  p_km_in integer,
+  p_responsible_name text,
+  p_notes text default null,
+  p_driver_id uuid default null,
+  p_commitment text default null,
+  p_budget_ref text default null,
+  p_parent_id uuid default null,
+  p_number text default null
+) returns uuid
+language plpgsql security definer set search_path = public, auth as $$
+declare
+  v_id uuid; v_veh vehicle%rowtype; v_sup supplier%rowtype; v_dep department%rowtype;
+  v_parent service_authorization%rowtype;
+  v_services numeric(12,2) := round(coalesce(p_value_services, 0), 2);
+  v_parts numeric(12,2) := round(coalesce(p_value_parts, 0), 2);
+  v_total numeric(12,2); v_km integer := p_km_in;
+  v_numbering text; v_ext text := nullif(btrim(coalesce(p_number, '')), '');
+  v_year smallint; v_seq integer; v_number text;
+  v_commit text := nullif(btrim(coalesce(p_commitment, '')), '');
+  v_budget text := nullif(btrim(coalesce(p_budget_ref, '')), '');
+  v_issuer_name text; v_issuer_role text; v_qr text;
+begin
+  if current_user_role() is null or current_user_role() not in ('admin','usuario') then
+    raise exception 'Seu perfil não pode emitir ordem de serviço.' using errcode = '42501';
+  end if;
+
+  select * into v_veh from vehicle where id = p_vehicle_id and deleted_at is null;
+  if v_veh.id is null then raise exception 'Veículo não encontrado.'; end if;
+  select * into v_sup from supplier where id = p_supplier_id;
+  if v_sup.id is null then raise exception 'Mecânica não encontrada.'; end if;
+  if v_sup.kind not in ('mecanica','ambos') then
+    raise exception 'Fornecedor cadastrado apenas como Posto não pode receber ordem de serviço.';
+  end if;
+  if v_sup.department_id is null then
+    raise exception 'O contrato da mecânica não tem secretaria. Informe a secretaria no cadastro do fornecedor.';
+  end if;
+  if v_veh.department_id is not null and v_sup.department_id <> v_veh.department_id then
+    raise exception 'A mecânica não tem contrato com a secretaria do veículo.';
+  end if;
+  if current_user_role() = 'usuario' and current_user_department_id() is not null
+     and current_user_department_id() is distinct from v_sup.department_id then
+    raise exception 'Você só pode emitir ordem de serviço para a sua secretaria.' using errcode = '42501';
+  end if;
+  select * into v_dep from department where id = v_sup.department_id;
+
+  -- Valores: serviços (mão de obra) e peças; o estimado é a soma
+  if v_services < 0 or v_parts < 0 then raise exception 'Os valores não podem ser negativos.'; end if;
+  v_total := v_services + v_parts;
+  if v_total <= 0 then raise exception 'Informe o valor estimado de serviços ou de peças.'; end if;
+
+  -- Km na entrada na oficina
+  if v_veh.vehicle_type_code = 99 then
+    v_km := 99999999;
+  else
+    if v_km is null then raise exception 'Informe o km do veículo na entrada na oficina.'; end if;
+    if v_km < 0 or v_km >= 99999999 then raise exception 'Km na entrada inválido.'; end if;
+    if v_veh.current_km > 0 and v_km < v_veh.current_km then
+      raise exception 'O km na entrada (%) é menor que o último km registrado do veículo (%).', v_km, v_veh.current_km;
+    end if;
+  end if;
+
+  -- OS complementar: mesma placa, origem numerada e não cancelada (pode estar concluída)
+  if p_parent_id is not null then
+    select * into v_parent from service_authorization where id = p_parent_id and deleted_at is null;
+    if v_parent.id is null then raise exception 'Ordem de serviço de origem não encontrada.'; end if;
+    if v_parent.os_number is null then raise exception 'A ordem de origem não é uma Ordem de Serviço numerada.'; end if;
+    if v_parent.status = 'cancelada' then raise exception 'A ordem de origem está cancelada.'; end if;
+    if v_parent.vehicle_id <> p_vehicle_id then
+      raise exception 'A OS complementar precisa ser do mesmo veículo da ordem de origem (%).', v_parent.vehicle_plate_snapshot;
+    end if;
+  end if;
+
+  -- Numeração: sequência geral do município no exercício, própria das OS
+  select coalesce(service_order_numbering, 'auto') into v_numbering from entity where id = 1;
+  if v_ext is not null and v_numbering <> 'opcional' then
+    raise exception 'Esta cidade numera as ordens de serviço automaticamente. Deixe o número em branco.';
+  end if;
+  if length(v_ext) > 30 then raise exception 'O número da ordem tem no máximo 30 caracteres.'; end if;
+  v_year := extract(year from p_date)::smallint;
+  perform pg_advisory_xact_lock(hashtext('service_order_' || v_year::text));
+  if v_ext is not null then
+    if exists (select 1 from service_authorization o
+                where o.os_year = v_year and o.deleted_at is null and o.status <> 'cancelada'
+                  and upper(btrim(o.os_number)) = upper(v_ext)) then
+      raise exception 'Já existe uma ordem de serviço nº % em %.', v_ext, v_year;
+    end if;
+    v_seq := null;
+    v_number := v_ext;
+  else
+    select coalesce(max(os_seq), 0) + 1 into v_seq from service_authorization where os_year = v_year;
+    loop   -- pula número que já tenha sido informado à mão
+      v_number := lpad(v_seq::text, greatest(3, length(v_seq::text)), '0') || '/' || v_year::text;
+      exit when not exists (select 1 from service_authorization o
+                             where o.os_year = v_year and o.deleted_at is null
+                               and upper(btrim(o.os_number)) = v_number);
+      v_seq := v_seq + 1;
+    end loop;
+  end if;
+
+  -- Emissão de sempre (limite mensal, QR, cópias do veículo e da mecânica)
+  if p_driver_id is not null then
+    v_id := emit_service_authorization_with_driver(p_date, p_vehicle_id, p_supplier_id, p_service_kind,
+              p_description, v_total, p_responsible_name, p_driver_id, p_notes);
+  else
+    v_id := emit_service_authorization(p_date, p_vehicle_id, p_supplier_id, p_service_kind,
+              p_description, v_total, p_responsible_name, p_notes);
+  end if;
+
+  -- Campos da OS e cópias do cabeçalho e de quem emitiu
+  select full_name, job_title into v_issuer_name, v_issuer_role from app_user where id = auth.uid();
+  select qr_payload into v_qr from service_authorization where id = v_id;
+  v_qr := replace(v_qr, E'\nData:', E'\nOS nº: ' || v_number || E'\nData:');
+  v_qr := _qr_service_values(v_qr, v_services, v_parts, v_total);
+
+  update service_authorization set
+    os_year = v_year, os_seq = v_seq, os_number = v_number, os_external = (v_ext is not null),
+    parent_id = p_parent_id,
+    commitment_number = v_commit,
+    commitment_set_by = case when v_commit is not null then auth.uid() end,
+    commitment_set_at = case when v_commit is not null then now() end,
+    km_in = v_km, budget_ref = v_budget,
+    value_services = v_services, value_parts = v_parts,
+    department_name_snapshot = v_dep.name,
+    department_cnpj_snapshot = v_dep.cnpj,
+    responsible_name_snapshot = _responsible_or_issuer(v_dep.responsible_name),
+    responsible_role_snapshot = v_dep.responsible_role,
+    supplier_cnpj_snapshot = v_sup.cnpj,
+    contract_number_snapshot = v_sup.contract_number,
+    issuer_name_snapshot = v_issuer_name,
+    issuer_role_snapshot = v_issuer_role,
+    qr_payload = v_qr
+  where id = v_id;
+
+  -- O km de entrada passa a ser a referência do veículo
+  if v_veh.vehicle_type_code <> 99 then
+    update vehicle set current_km = greatest(current_km, v_km) where id = p_vehicle_id;
+  end if;
+
+  return v_id;
+end;
+$$;
+revoke all on function emit_service_order(date,uuid,uuid,service_kind,text,numeric,numeric,integer,text,text,uuid,text,text,uuid,text) from public;
+grant execute on function emit_service_order(date,uuid,uuid,service_kind,text,numeric,numeric,integer,text,text,uuid,text,text,uuid,text) to authenticated;
+
+-- Edição enquanto emitida: categoria, serviço, valores, km de entrada, orçamento e observações.
+create or replace function update_service_order(
+  p_auth_id uuid,
+  p_service_kind service_kind,
+  p_description text,
+  p_value_services numeric,
+  p_value_parts numeric,
+  p_km_in integer,
+  p_budget_ref text default null,
+  p_notes text default null
+) returns void
+language plpgsql security definer set search_path = public, auth as $$
+declare
+  v_a service_authorization%rowtype; v_veh vehicle%rowtype;
+  v_services numeric(12,2) := round(coalesce(p_value_services, 0), 2);
+  v_parts numeric(12,2) := round(coalesce(p_value_parts, 0), 2);
+  v_total numeric(12,2); v_km integer := p_km_in;
+begin
+  select * into v_a from service_authorization where id = p_auth_id and deleted_at is null for update;
+  if v_a.id is null then raise exception 'Ordem de serviço não encontrada.'; end if;
+  if v_a.os_number is null then raise exception 'Esta autorização é anterior às ordens de serviço: use a edição antiga.'; end if;
+  if v_a.status <> 'emitida' then raise exception 'Só ordem de serviço emitida pode ser alterada.'; end if;
+  if current_user_role() = 'usuario' and current_user_department_id() is not null then
+    if not exists (select 1 from supplier s where s.id = v_a.supplier_id and s.department_id = current_user_department_id()) then
+      raise exception 'Você só pode alterar ordens de serviço da sua secretaria.' using errcode = '42501';
+    end if;
+  end if;
+  select * into v_veh from vehicle where id = v_a.vehicle_id;
+
+  if v_services < 0 or v_parts < 0 then raise exception 'Os valores não podem ser negativos.'; end if;
+  v_total := v_services + v_parts;
+  if v_total <= 0 then raise exception 'Informe o valor estimado de serviços ou de peças.'; end if;
+
+  if v_veh.vehicle_type_code = 99 then
+    v_km := 99999999;
+  else
+    if v_km is null then raise exception 'Informe o km do veículo na entrada na oficina.'; end if;
+    if v_km < 0 or v_km >= 99999999 then raise exception 'Km na entrada inválido.'; end if;
+    if v_km <> v_a.km_in and v_veh.current_km > 0 and v_km < v_veh.current_km then
+      raise exception 'O km na entrada (%) é menor que o último km registrado do veículo (%).', v_km, v_veh.current_km;
+    end if;
+  end if;
+
+  -- Campos de sempre pela função de sempre (recusa se não estiver emitida)
+  perform update_service_authorization(p_auth_id, p_service_kind, p_description, v_total, p_notes);
+
+  update service_authorization set
+    value_services = v_services, value_parts = v_parts, km_in = v_km,
+    budget_ref = nullif(btrim(coalesce(p_budget_ref, '')), ''),
+    qr_payload = _qr_service_values(
+      regexp_replace(regexp_replace(qr_payload,
+        E'\\nCategoria: [^\\n]*', E'\\nCategoria: ' || upper(p_service_kind::text)),
+        E'\\nServiço: [^\\n]*', E'\\nServiço: ' || p_description),
+      v_services, v_parts, v_total)
+  where id = p_auth_id;
+
+  if v_veh.vehicle_type_code <> 99 then
+    update vehicle set current_km = greatest(current_km, v_km) where id = v_a.vehicle_id;
+  end if;
+end;
+$$;
+revoke all on function update_service_order(uuid,service_kind,text,numeric,numeric,integer,text,text) from public;
+grant execute on function update_service_order(uuid,service_kind,text,numeric,numeric,integer,text,text) to authenticated;
+
+-- Empenho pode ser informado depois, enquanto a OS estiver emitida.
+create or replace function set_service_order_commitment(p_auth_id uuid, p_commitment text) returns void
+language plpgsql security definer set search_path = public, auth as $$
+declare v_a service_authorization%rowtype; v_c text := nullif(btrim(coalesce(p_commitment, '')), '');
+begin
+  select * into v_a from service_authorization where id = p_auth_id and deleted_at is null for update;
+  if v_a.id is null then raise exception 'Ordem de serviço não encontrada.'; end if;
+  if v_a.os_number is null then raise exception 'Esta autorização é anterior às ordens de serviço e não tem empenho.'; end if;
+  if current_user_role() is null or current_user_role() not in ('admin','usuario') then
+    raise exception 'Seu perfil não pode alterar o empenho.' using errcode = '42501';
+  end if;
+  if current_user_role() = 'usuario' and current_user_department_id() is not null then
+    if not exists (select 1 from supplier s where s.id = v_a.supplier_id and s.department_id = current_user_department_id()) then
+      raise exception 'Você só pode alterar ordens de serviço da sua secretaria.' using errcode = '42501';
+    end if;
+  end if;
+  if v_a.status <> 'emitida' then
+    raise exception 'O empenho só pode ser alterado enquanto a ordem de serviço está emitida.';
+  end if;
+  update service_authorization
+     set commitment_number = v_c,
+         commitment_set_by = case when v_c is not null then auth.uid() end,
+         commitment_set_at = case when v_c is not null then now() end
+   where id = p_auth_id;
+end;
+$$;
+revoke all on function set_service_order_commitment(uuid, text) from public;
+grant execute on function set_service_order_commitment(uuid, text) to authenticated;
+
+-- Cancela a OS com justificativa. Mantém o número (automática) e o histórico.
+create or replace function cancel_service_order(p_auth_id uuid, p_reason text) returns void
+language plpgsql security definer set search_path = public, auth as $$
+declare v_a service_authorization%rowtype; v_r text := btrim(coalesce(p_reason, ''));
+begin
+  select * into v_a from service_authorization where id = p_auth_id and deleted_at is null for update;
+  if v_a.id is null then raise exception 'Ordem de serviço não encontrada.'; end if;
+  if current_user_role() is null or current_user_role() not in ('admin','usuario') then
+    raise exception 'Seu perfil não pode cancelar ordem de serviço.' using errcode = '42501';
+  end if;
+  if current_user_role() = 'usuario' and current_user_department_id() is not null then
+    if not exists (select 1 from supplier s where s.id = v_a.supplier_id and s.department_id = current_user_department_id()) then
+      raise exception 'Você só pode cancelar ordens de serviço da sua secretaria.' using errcode = '42501';
+    end if;
+  end if;
+  if v_a.status = 'cancelada' then raise exception 'Esta ordem de serviço já está cancelada.'; end if;
+  if v_a.status <> 'emitida' then raise exception 'Ordem de serviço concluída não pode ser cancelada. Cancele o termo antes.'; end if;
+  if length(v_r) < 5 then raise exception 'Informe a justificativa do cancelamento.'; end if;
+
+  perform cancel_service_authorization(p_auth_id);
+  update service_authorization
+     set cancel_reason = v_r, canceled_by = auth.uid(), canceled_at = now()
+   where id = p_auth_id;
+end;
+$$;
+revoke all on function cancel_service_order(uuid, text) from public;
+grant execute on function cancel_service_order(uuid, text) to authenticated;
+
+-- Excluir: ordem que é origem de uma complementar não sai.
+create or replace function delete_service_authorization(p_auth_id uuid) returns void
+language plpgsql security definer set search_path = public, auth as $$
+begin
+  if exists (select 1 from service_authorization c where c.parent_id = p_auth_id) then
+    raise exception 'Esta ordem de serviço é origem de uma OS complementar e não pode ser excluída.';
+  end if;
+  delete from service_authorization where id = p_auth_id;
+  if not found then raise exception 'Autorização não encontrada'; end if;
+end;
+$$;
+revoke all on function delete_service_authorization(uuid) from public;
+grant execute on function delete_service_authorization(uuid) to authenticated;
+
 -- Reload do schema cache do PostgREST
 notify pgrst, 'reload schema';

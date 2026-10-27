@@ -6,6 +6,7 @@ import { isAdmin } from '../auth.js';
 
 let _items = [];
 let _users = [];  // usuários com role='usuario' (candidatos a responsáveis)
+let _usernames = [];  // todos os logins: o campo "Responsável" não pode ser um login
 let _searchTerm = '';
 // false quando o banco ainda não recebeu o apply.sql do faturamento
 let _hasBillingCols = true;
@@ -76,8 +77,11 @@ async function loadAll() {
   }
   if (d.error) { toast('Falha ao carregar secretarias: ' + d.error.message, 'error'); _items = []; }
   else _items = d.data || [];
-  if (u.error) { _users = []; }
-  else _users = (u.data || []).filter(x => x.active && (x.role === 'usuario' || x.role === 'admin'));
+  if (u.error) { _users = []; _usernames = []; }
+  else {
+    _users = (u.data || []).filter(x => x.active && (x.role === 'usuario' || x.role === 'admin'));
+    _usernames = (u.data || []).map(x => String(x.username || '').toLowerCase());
+  }
 }
 
 function matchesSearch(d, t) {
@@ -214,7 +218,8 @@ function openDeptModal(id) {
         <div class="field">
           <label class="field-label">Responsável</label>
           <input class="input" name="responsible_name" value="${esc(d?.responsible_name || '')}"
-                 placeholder="Nome do gestor">
+                 placeholder="Nome completo do gestor">
+          <span class="field-help">Assina a Ordem de Fornecimento e os termos. Nome completo, não o usuário de login.</span>
         </div>
         <div class="field">
           <label class="field-label">Cargo do responsável</label>
@@ -274,6 +279,9 @@ async function saveDept(id) {
     phone: (v.phone || '').trim() || null,
     email: (v.email || '').trim() || null,
   };
+  if (payload.responsible_name && _usernames.includes(payload.responsible_name.toLowerCase())) {
+    toast('Informe o nome completo do responsável, não o usuário de login.', 'error'); return;
+  }
   if (_hasBillingCols) {
     const cnpj = onlyDigits(v.cnpj);
     if (cnpj && !isValidCNPJ(cnpj)) { toast('CNPJ inválido. Confira os dígitos.', 'error'); return; }

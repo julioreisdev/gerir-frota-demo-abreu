@@ -1,6 +1,6 @@
 import { pageRoot, pageHeader } from '../shell.js';
 import { supabase } from '../supabase.js';
-import { esc, fmtDate, toast, openModal, closeModal, confirmDialog, formValues, supplierOptionLabel } from '../ui.js';
+import { esc, fmtDate, toast, openModal, closeModal, confirmDialog, formValues, supplierOptionLabel, isMissingColumn } from '../ui.js';
 import { icons } from '../icons.js';
 import { getProfile } from '../auth.js';
 
@@ -74,6 +74,7 @@ function matchesSearch(u, t) {
   const term = t.toLowerCase();
   return (u.username || '').toLowerCase().includes(term)
       || (u.full_name || '').toLowerCase().includes(term)
+      || (u.job_title || '').toLowerCase().includes(term)
       || (u.email || '').toLowerCase().includes(term);
 }
 
@@ -159,7 +160,10 @@ function userRow(u, me) {
   return `
     <tr>
       <td data-label="Usuário"><strong>${esc(u.username)}</strong></td>
-      <td data-label="Nome">${esc(u.full_name)}${isMe ? ' <span class="badge badge-neutral" style="margin-left:6px">você</span>' : ''}</td>
+      <td data-label="Nome"><div class="cell-stack">
+        <span>${esc(u.full_name)}${isMe ? ' <span class="badge badge-neutral" style="margin-left:6px">você</span>' : ''}</span>
+        ${u.job_title ? `<span style="font-size:11.5px;color:var(--text-muted)">${esc(u.job_title)}</span>` : ''}
+      </div></td>
       <td data-label="E-mail" style="color:var(--text-soft);font-size:12.5px">${esc(u.email || '—')}</td>
       <td data-label="Perfil"><span class="${ROLE_BADGE[u.role] || 'badge'}">${esc(ROLE_LABEL[u.role] || u.role)}</span></td>
       <td data-label="Status">${statusBadge}</td>
@@ -198,6 +202,12 @@ function openUserModal(id) {
         <div class="field">
           <label class="field-label">Nome completo <span class="req">*</span></label>
           <input class="input" name="full_name" required value="${esc(u?.full_name || '')}" autocomplete="off">
+        </div>
+        <div class="field col-full">
+          <label class="field-label">Cargo</label>
+          <input class="input" name="job_title" maxlength="80" value="${esc(u?.job_title || '')}" autocomplete="off"
+                 placeholder="ex: Coordenação de Frota">
+          <span class="field-help">Sai na assinatura da Ordem de Serviço emitida por este usuário.</span>
         </div>
         ${editing ? `
         <div class="field col-full">
@@ -266,6 +276,7 @@ async function saveUser(id) {
   if (!form.checkValidity()) { form.reportValidity(); return; }
   const v = formValues(form);
   v.username = (v.username || '').toLowerCase();
+  v.job_title = (v.job_title || '').trim() || null;
   v.monthly_authorization_limit = Number(v.monthly_authorization_limit || 0);
   v.access_start = v.access_start || null;
   v.access_end = v.access_end || null;
@@ -288,9 +299,10 @@ async function saveUser(id) {
         monthly_authorization_limit: v.monthly_authorization_limit,
       }).eq('id', id);
       if (error) throw error;
+      await saveJobTitle(id, v.job_title);
       toast('Usuário atualizado.', 'success');
     } else {
-      const { error } = await supabase.rpc('admin_create_user', {
+      const { data: newId, error } = await supabase.rpc('admin_create_user', {
         p_email: v.email,
         p_password: v.password,
         p_username: v.username,
@@ -302,6 +314,7 @@ async function saveUser(id) {
         p_monthly_authorization_limit: v.monthly_authorization_limit,
       });
       if (error) throw error;
+      if (newId) await saveJobTitle(newId, v.job_title);
       toast('Usuário criado com sucesso.', 'success');
     }
     closeModal();
@@ -311,6 +324,15 @@ async function saveUser(id) {
     btn.disabled = false;
     btn.textContent = id ? 'Salvar alterações' : 'Criar usuário';
   }
+}
+
+/** Cargo: coluna à parte, gravada depois do cadastro (admin_create_user não muda).
+ *  Banco em versão anterior (sem a coluna): avisa e segue. */
+async function saveJobTitle(id, jobTitle) {
+  const { error } = await supabase.from('app_user').update({ job_title: jobTitle }).eq('id', id);
+  if (!error) return;
+  if (isMissingColumn(error)) { toast('Cargo não gravado: execute o apply.sql no Supabase.', 'warning', 6000); return; }
+  throw error;
 }
 
 async function toggleActive(id) {

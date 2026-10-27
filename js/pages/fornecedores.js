@@ -528,7 +528,7 @@ function openForModal(id) {
                  placeholder="ex: 012/2025">
         </div>
         ${_hasBillingCols ? `
-        <div class="field col-full" data-billing-field style="display:${kind === 'mecanica' ? 'none' : ''}">
+        <div class="field col-full" data-price-field style="display:${kind === 'mecanica' ? 'none' : ''}">
           <label class="field-label">Tipo de preço do contrato</label>
           <select class="select" name="price_type">
             <option value="fixo" ${(s?.price_type || 'fixo') === 'fixo' ? 'selected' : ''}>Preço fixo por litro</option>
@@ -536,30 +536,30 @@ function openForModal(id) {
           </select>
           <span class="field-help">Preço fixo: o Termo de Recebimento já vem com o preço do contrato. Desconto sobre a bomba: o fiscal informa o preço da nota ao gerar o termo.</span>
         </div>
-        <div class="field col-full" data-billing-field style="display:${kind === 'mecanica' ? 'none' : ''}">
+        <div class="field col-full">
           <label class="field-label">Fiscal do contrato</label>
           <input class="input" name="fiscal_name" maxlength="120" value="${esc(s?.fiscal_name || '')}"
                  placeholder="Nome completo do fiscal">
-          <span class="field-help">Assina o Termo de Recebimento.${_hasFiscalDoc ? ' Informado o fiscal, CPF e portaria (número e data) são obrigatórios.' : ''}</span>
+          <span class="field-help">Assina o Termo de Recebimento (combustível ou serviço).${_hasFiscalDoc ? ' Informado o fiscal, CPF e portaria (número e data) são obrigatórios.' : ''}</span>
         </div>
         ${_hasFiscalDoc ? `
-        <div class="field" data-billing-field style="display:${kind === 'mecanica' ? 'none' : ''}">
+        <div class="field">
           <label class="field-label">CPF do fiscal</label>
           <input class="input" name="fiscal_cpf" inputmode="numeric" maxlength="14" autocomplete="off"
                  value="${esc(fmtCPF(_fiscalCpf.get(s?.id) || ''))}" placeholder="000.000.000-00">
           <span class="field-help">Nunca é impresso por inteiro.</span>
         </div>` : ''}
-        <div class="field" data-billing-field style="display:${kind === 'mecanica' ? 'none' : ''}">
+        <div class="field">
           <label class="field-label">Matrícula do fiscal (opcional)</label>
           <input class="input" name="fiscal_registration" maxlength="30" value="${esc(s?.fiscal_registration || '')}">
         </div>
-        <div class="field" data-billing-field style="display:${kind === 'mecanica' ? 'none' : ''}">
+        <div class="field">
           <label class="field-label">Portaria de designação nº</label>
           <input class="input" name="fiscal_ordinance" maxlength="60" value="${esc(normOrdinance(s?.fiscal_ordinance))}"
                  placeholder="ex: 045/2026">
         </div>
         ${_hasFiscalDoc ? `
-        <div class="field" data-billing-field style="display:${kind === 'mecanica' ? 'none' : ''}">
+        <div class="field">
           <label class="field-label">Data da portaria</label>
           <input class="input" type="date" name="fiscal_ordinance_date" max="${localToday()}" value="${esc(s?.fiscal_ordinance_date || '')}">
         </div>` : ''}` : ''}
@@ -608,8 +608,8 @@ function openForModal(id) {
       const k = btn.dataset.kind;
       m.querySelector('#for-kind-input').value = k;
       m.querySelector('#fuels-block').style.display = (k === 'mecanica') ? 'none' : '';
-      // Faturamento é só de combustível: mecânica não tem tipo de preço nem fiscal
-      m.querySelectorAll('[data-billing-field]').forEach(el => { el.style.display = (k === 'mecanica') ? 'none' : ''; });
+      // Tipo de preço é só do combustível; o fiscal do contrato vale para posto e mecânica
+      m.querySelectorAll('[data-price-field]').forEach(el => { el.style.display = (k === 'mecanica') ? 'none' : ''; });
     });
   });
 
@@ -777,7 +777,6 @@ async function saveFor(id) {
     department_id: v.department_id || null,
     contract_number: (v.contract_number || '').trim() || null,
   };
-  const isFuelSupplier = v.kind !== 'mecanica';
   if (_hasBillingCols) {
     payload.price_type = v.price_type === 'desconto_bomba' ? 'desconto_bomba' : 'fixo';
     payload.fiscal_name = (v.fiscal_name || '').trim() || null;
@@ -785,12 +784,11 @@ async function saveFor(id) {
     payload.fiscal_ordinance = (_hasFiscalDoc ? normOrdinance(v.fiscal_ordinance) : (v.fiscal_ordinance || '').trim()) || null;
   }
   if (_hasBillingCols && _hasFiscalDoc) {
+    // Fiscal vale para posto e mecânica (termo de combustível e termo de serviço)
     payload.fiscal_ordinance_date = v.fiscal_ordinance_date || null;
-    if (isFuelSupplier) {
-      const fe = fiscalError({ name: payload.fiscal_name, cpf: v.fiscal_cpf, registration: payload.fiscal_registration,
-                               ordinance: payload.fiscal_ordinance, ordinance_date: payload.fiscal_ordinance_date });
-      if (fe) { showErr(errBox, [fe]); return; }
-    }
+    const fe = fiscalError({ name: payload.fiscal_name, cpf: v.fiscal_cpf, registration: payload.fiscal_registration,
+                             ordinance: payload.fiscal_ordinance, ordinance_date: payload.fiscal_ordinance_date });
+    if (fe) { showErr(errBox, [fe]); return; }
   }
 
   const btn = document.getElementById('for-save-btn');

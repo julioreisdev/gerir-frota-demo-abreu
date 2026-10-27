@@ -368,6 +368,19 @@ Pedidos do cliente em `atualizado-gerir-frota-of-termo/` (fora do git).
 - O nome do motorista é gravado como cópia (`driver_name_snapshot`) na autorização, no abastecimento e na manutenção.
 - Regras de CNH e o campo de escolha ficam em [js/drivers.js](js/drivers.js).
 
+## Ordem de Serviço e Termo de Serviço (out/2026, em andamento)
+
+Pedido do cliente de 27/10/2026 (`Pedido Cliente 27 de Out 26/`, fora do git). Planejamento completo em `PLANEJAMENTO_OS_MANUTENCAO.md`, na raiz e fora do git. O essencial para não quebrar nada:
+
+- **A autorização de manutenção é a Ordem de Serviço.** Tabela `service_authorization` ganhou as colunas da OS (`os_number` `NNN/AAAA`, `os_year`, `os_seq`, `os_external`, `parent_id`, `commitment_number`, `km_in`, `budget_ref`, `value_services`, `value_parts`, cópias do cabeçalho e de quem emitiu). O código `AAAAMMDD-MAN-NNN` continua em `number` e no QR. Autorização antiga sem `os_number` segue o fluxo antigo.
+- **Status não muda**: o enum `authorization_status` é compartilhado com o abastecimento. Na manutenção, `utilizada` é mostrado como "Concluída".
+- **`emit_service_authorization` e `emit_service_authorization_with_driver` não mudam.** A OS é emitida por `emit_service_order`, que chama a antiga e grava o resto (numeração, valores, km, cópias). Edição por `update_service_order`, empenho por `set_service_order_commitment`, cancelamento com justificativa por `cancel_service_order`.
+- **Numeração da OS**: sequência própria, geral do município por ano. `entity.service_order_numbering` = `'auto'` (só automática) ou `'opcional'` (campo "Nº da OS" aceita número de outro sistema; em branco = automática). Único no ano entre automáticas e informadas (`ux_service_order_number_active`); automática pula número já informado.
+- **Km de entrada**: bloqueia menor que `vehicle.current_km` quando este é > 0; a emissão grava `greatest(current_km, km_in)` no veículo. Tipo 99 usa 99999999.
+- **Assinaturas**: `app_user.job_title` (cargo) sai na OS com `full_name` de quem emitiu. Nos documentos do combustível, o responsável da secretaria passa por `_responsible_or_issuer` (gatilho na inserção de `supply_order` e `receipt_term`): vazio ou igual a um login vira o nome completo de quem emitiu. O campo "Responsável" da secretaria recusa um login (gatilho `department_responsible_check`).
+- **Fiscal do contrato vale para mecânica** (Fornecedores e Configuração mostram para todos os tipos). Perfil `fornecedor` não tem mais Dashboard.
+- Partes entregues: **1 (base)**. Faltam: 2 (tela e PDF da OS), 3 (termo: banco), 4 (termo: telas e PDF), 5 (layout portátil).
+
 ### Tolerância a banco desatualizado
 
 As telas novas funcionam com o banco na versão anterior: quando uma coluna ou tabela não existe, a consulta é repetida sem ela e o recurso some da tela. Ao acrescentar coluna em consulta existente, manter esse padrão.
